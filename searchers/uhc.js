@@ -5,27 +5,29 @@ const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
 
-/**
- * @param {object} opts
- * @param {string} opts.specialty  - e.g. "Cardiologist", "Primary Care"
- * @param {string} opts.zip        - 5-digit ZIP code
- * @param {number} [opts.maxResults=50]
- * @returns {Promise<Array>} normalized provider objects
- */
 async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults = 50 } = {}) {
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--no-zygote',
+      '--single-process',
+    ],
   });
 
   try {
-    const page = await browser.newPage();
-    page.setDefaultTimeout(45000);
-    await page.setViewportSize({ width: 1280, height: 900 });
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'en-US,en;q=0.9',
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      locale: 'en-US',
+      viewport: { width: 1280, height: 900 },
+      extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
     });
+
+    const page = await context.newPage();
+    page.setDefaultTimeout(60000);
 
     const providerBatches = [];
 
@@ -43,40 +45,24 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
       }
     });
 
-    // Step 1: Navigate directly to find-care with Choice Plus plan + ZIP
-    // Use 'load' instead of 'networkidle' — UHC's SPA has persistent connections
-    // that prevent networkidle from ever firing.
+    // Step 1: Establish guest session first (short timeout, ignore errors)
+    try {
+      await page.goto('https://findcare.guest.uhc.com/guest-plan-selection/', {
+        waitUntil: 'domcontentloaded', timeout: 20000,
+      });
+      await page.waitForTimeout(2000);
+    } catch {}
+
+    // Step 2: Navigate to find-care with plan + zip
     await page.goto(
       `https://findcare.guest.uhc.com/find-care?plan=s00001&zip=${encodeURIComponent(zip)}`,
-      { waitUntil: 'load', timeout: 40000 }
+      { waitUntil: 'domcontentloaded', timeout: 40000 }
     );
-    await page.waitForTimeout(2500);
 
-    // Step 2: Confirm the page loaded with the right ZIP.
-    // UHC renders a location input; check it and correct if needed.
-    const locationInput = page.locator(
-      'input[placeholder*="City" i], input[placeholder*="Zip" i], input[placeholder*="Location" i], input[aria-label*="location" i], input[aria-label*="zip" i]'
-    ).first();
+    // Wait for React SPA to hydrate
+    await page.waitForTimeout(4000);
 
-    if (await locationInput.count() > 0 && await locationInput.isVisible()) {
-      const currentVal = await locationInput.inputValue().catch(() => '');
-      if (!currentVal.includes(zip)) {
-        // ZIP wasn't applied from URL — set it manually
-        await locationInput.click({ clickCount: 3 });
-        await locationInput.type(zip, { delay: 60 });
-        await page.waitForTimeout(1200);
-        // Click first suggestion if dropdown appears
-        const locOpt = page.locator('[role="option"]').first();
-        if (await locOpt.count() > 0) {
-          await locOpt.click();
-        } else {
-          await page.keyboard.press('Tab');
-        }
-        await page.waitForTimeout(800);
-      }
-    }
-
-    // Step 3: Dismiss Smart Choice / modal if present
+    // Step 3: Dismiss any modal
     await page.evaluate(() => {
       const selectors = [
         'button[aria-label="close"]', 'button[aria-label="Close"]',
@@ -95,37 +81,47 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
         if (btn) btn.click();
       });
     });
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(1000);
 
-    // Step 4: Find the specialty / provider-name search input.
-    // UHC renders two comboboxes: specialty (first) and location (second).
-    // We want the FIRST visible combobox.
-    await page.waitForSelector('input[role="combobox"]', { timeout: 15000 }).catch(() => {});
+    // Step 4: Wait for combobox with longer timeout
+    await page.waitForSelector('input[role="combobox"]', { timeout: 20000 }).catch(() => {});
 
+    // Try to find specialty input — check all comboboxes
     const allComboboxes = await page.locator('input[role="combobox"]').all();
     let searchInput = null;
+
     for (const cb of allComboboxes) {
-      const ph = await cb.getAttribute('placeholder').catch(() => '');
-      const al = await cb.getAttribute('aria-label').catch(() => '');
       const visible = await cb.isVisible().catch(() => false);
       if (!visible) continue;
-      // The specialty box usually mentions "name", "specialty", "doctor", or is generic
-      if (ph.match(/name|specialty|doctor|provider|search/i) ||
-          al.match(/name|specialty|doctor|provider|search/i) ||
-          (!ph.match(/zip|city|location|address/i) && !al.match(/zip|city|location|address/i))) {
-        searchInput = cb;
-        break;
+      const ph = await cb.getAttribute('placeholder').catch(() => '') || '';
+      const al = await cb.getAttribute('aria-label').catch(() => '') || '';
+      if (ph.match(/zip|city|location|address/i) || al.match(/zip|city|location|address/i)) continue;
+      searchInput = cb;
+      break;
+    }
+
+    // Fallback: any visible input that looks like a search box
+    if (!searchInput) {
+      const inputs = await page.locator('input[type="text"], input:not([type])').all();
+      for (const inp of inputs) {
+        const visible = await inp.isVisible().catch(() => false);
+        if (!visible) continue;
+        const ph = await inp.getAttribute('placeholder').catch(() => '') || '';
+        if (ph.match(/zip|city|location|address/i)) continue;
+        if (ph.match(/name|specialty|doctor|provider|search/i) || ph.length > 0) {
+          searchInput = inp;
+          break;
+        }
       }
     }
-    if (!searchInput && allComboboxes.length > 0) {
-      searchInput = allComboboxes[0]; // fallback to first
+
+    if (!searchInput) {
+      throw new Error('UHC: could not find specialty search input');
     }
 
-    if (!searchInput) throw new Error('UHC: could not find specialty search input');
-
-    // Step 5: Type specialty and wait for providers
+    // Step 5: Type specialty and wait for GraphQL response
     const searchDone = new Promise(resolve => {
-      setTimeout(resolve, 20000); // max wait
+      setTimeout(resolve, 25000);
       const check = setInterval(() => {
         if (providerBatches.length > 0) { clearInterval(check); setTimeout(resolve, 2000); }
       }, 200);
@@ -135,7 +131,6 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
     await searchInput.type(specialty, { delay: 80 });
     await page.waitForTimeout(1500);
 
-    // Wait for and click first autocomplete option
     await page.waitForSelector('[role="option"]', { timeout: 8000 }).catch(() => {});
     const firstOption = page.locator('[role="option"]').first();
     if (await firstOption.count() > 0) {
@@ -145,7 +140,7 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
     }
     await page.waitForTimeout(300);
 
-    // Click Search button if visible
+    // Click Search button if present
     await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find(b =>
         b.textContent?.trim().toLowerCase() === 'search' && b.offsetParent !== null
@@ -154,18 +149,15 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
     });
 
     await searchDone;
-    await page.waitForTimeout(1500); // let extra batches arrive
+    await page.waitForTimeout(2000);
 
-    // Merge all batches, dedupe by providerId + locationId
+    // Merge and dedupe
     const seen = new Set();
     const all = [];
     for (const batch of providerBatches) {
       for (const p of batch) {
         const key = p.providerId + ':' + (p.locationId || '');
-        if (!seen.has(key)) {
-          seen.add(key);
-          all.push(p);
-        }
+        if (!seen.has(key)) { seen.add(key); all.push(p); }
       }
     }
 
