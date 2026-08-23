@@ -111,37 +111,80 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
       }
     });
 
-    // Collect all ProviderSearch GraphQL responses
+    // Collect all GraphQL responses that contain providers (ProviderSearch OR name search queries)
     page.on('response', async res => {
       const url = res.url();
-      if (url.includes('findcare.guest.uhc.com/api/graphql') && url.includes('q=ProviderSearch')) {
-        try {
-          const body = await res.json();
-          const providers = body?.data?.providerSearch?.providers;
-          if (Array.isArray(providers) && providers.length > 0) {
-            providerBatches.push(providers);
+      if (!url.includes('findcare.guest.uhc.com/api/graphql')) return;
+      try {
+        const body = await res.json();
+        // ProviderSearch (specialty) — providers array
+        const bySpecialty = body?.data?.providerSearch?.providers;
+        if (Array.isArray(bySpecialty) && bySpecialty.length > 0) {
+          console.log(`[UHC] Captured ${bySpecialty.length} providers from ProviderSearch`);
+          providerBatches.push(bySpecialty);
+          return;
+        }
+        // Name search may use a different query key — scan all data keys
+        const data = body?.data;
+        if (data) {
+          for (const key of Object.keys(data)) {
+            const val = data[key];
+            const arr = val?.providers || val?.providerList || (Array.isArray(val) ? val : null);
+            if (Array.isArray(arr) && arr.length > 0 && arr[0]?.providerName) {
+              console.log(`[UHC] Captured ${arr.length} providers from query key: ${key}`);
+              providerBatches.push(arr);
+              return;
+            }
           }
-        } catch {}
-      }
+        }
+      } catch {}
     });
 
-    // Step 1: Navigate directly to Choice Plus Network plan
-    await page.goto(
-      `https://findcare.guest.uhc.com/guest-plan-selection/browse?deeplink=${CHOICE_PLUS_DEEPLINK}`,
-      { waitUntil: 'domcontentloaded', timeout: 40000 }
-    ).catch(() => {});
-    await page.waitForTimeout(3000);
+    // Step 1: Navigate — specialty uses the proven URL, name uses the deeplink flow
+    if (isNameSearch) {
+      // Deeplink → ZIP entry page → unified search (supports doctor name search)
+      await page.goto(
+        `https://findcare.guest.uhc.com/guest-plan-selection/browse?deeplink=${CHOICE_PLUS_DEEPLINK}`,
+        { waitUntil: 'domcontentloaded', timeout: 40000 }
+      ).catch(() => {});
+      await page.waitForTimeout(2500);
+      console.log(`[UHC] Name search — deeplink nav: ${page.url()}`);
 
-    // If that redirected somewhere odd, try the find-care URL as fallback
-    if (!page.url().includes('findcare.guest.uhc.com')) {
+      // Enter ZIP on the location/ZIP page
+      const zipFilled = await page.evaluate((z) => {
+        const candidates = Array.from(document.querySelectorAll('input'));
+        const zipInput = candidates.find(el =>
+          /zip|postal|location|city/i.test(el.placeholder || el.getAttribute('aria-label') || el.id || el.name || '')
+        ) || candidates.find(el => el.offsetParent !== null && el.type !== 'hidden');
+        if (!zipInput) return false;
+        zipInput.value = z;
+        zipInput.dispatchEvent(new Event('input',  { bubbles: true }));
+        zipInput.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      }, zip);
+
+      if (zipFilled) {
+        await page.waitForTimeout(800);
+        await page.evaluate(() => {
+          const btn = Array.from(document.querySelectorAll('button, input[type="submit"]')).find(b =>
+            b.offsetParent !== null && /search|continue|submit|find|go/i.test(b.textContent || b.value || '')
+          );
+          if (btn) btn.click();
+        });
+        await page.waitForTimeout(3000);
+        console.log(`[UHC] After ZIP submit: ${page.url()}`);
+      }
+    } else {
+      // Original working URL for specialty/category search
       await page.goto(
         `https://findcare.guest.uhc.com/find-care?plan=s00001&zip=${encodeURIComponent(zip)}`,
         { waitUntil: 'domcontentloaded', timeout: 40000 }
-      );
+      ).catch(() => {});
       await page.waitForTimeout(3000);
+      console.log(`[UHC] Specialty search — find-care nav: ${page.url()}`);
     }
 
-    // Step 2: Dismiss any modal
+    // Step 3: Dismiss any modal
     await page.evaluate(() => {
       const selectors = [
         'button[aria-label="close"]', 'button[aria-label="Close"]',
@@ -153,12 +196,14 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
         if (el && el.offsetParent !== null) { el.click(); return; }
       }
     });
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(800);
 
-    // Step 3: Find the main search combobox
-    await page.waitForSelector('input[role="combobox"]', { timeout: 20000 }).catch(() => {});
+    // Step 4: Find the main search input (unified search: doctors/hospitals/names)
+    await page.waitForSelector('input[role="combobox"], input[type="search"], input[type="text"]', { timeout: 20000 }).catch(() => {});
 
-    const allComboboxes = await page.locator('input[role="combobox"]').all();
+    // The unified search page has ALL selected by default (doctors/hospitals/names)
+    // Find the search input — avoid the ZIP/location field
+    const allComboboxes = await page.locator('input[role="combobox"], input[type="search"]').all();
     let searchInput = null;
 
     for (const cb of allComboboxes) {
