@@ -62,6 +62,29 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
     // Wait for React SPA to hydrate
     await page.waitForTimeout(4000);
 
+    // Step 2b: Force the ZIP — cloud server IP may default to wrong location
+    try {
+      const locInput = page.locator(
+        'input[placeholder*="City" i], input[placeholder*="Zip" i], input[placeholder*="Location" i], input[aria-label*="location" i], input[aria-label*="zip" i]'
+      ).first();
+      if (await locInput.count() > 0 && await locInput.isVisible()) {
+        const currentVal = await locInput.inputValue().catch(() => '');
+        if (!currentVal.includes(zip)) {
+          await locInput.click({ clickCount: 3 });
+          await locInput.fill('');
+          await locInput.type(zip, { delay: 80 });
+          await page.waitForTimeout(1500);
+          const locOpt = page.locator('[role="option"]').first();
+          if (await locOpt.count() > 0) {
+            await locOpt.click();
+          } else {
+            await page.keyboard.press('Enter');
+          }
+          await page.waitForTimeout(1500);
+        }
+      }
+    } catch {}
+
     // Step 3: Dismiss any modal
     await page.evaluate(() => {
       const selectors = [
