@@ -1,10 +1,15 @@
 // searchers/uhc.js
-// UHC Choice Plus provider search — patches lat/lon from ZIP in GraphQL request
+// UHC Choice Plus provider search — supports specialty AND name search
+// Patches lat/lon from ZIP so Railway's CA IP doesn't skew results
 
 const https = require('https');
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
+
+// Choice Plus Network deeplink (reciprocityId 10188)
+const CHOICE_PLUS_DEEPLINK =
+  'eyJsYW5ndWFnZSI6ImVuLVVTIiwibG9iIjoiRUkiLCJjb3ZlcmFnZVR5cGUiOiJNIiwicmVjaXByb2NpdHlJZCI6IjEwMTg4IiwicGxhbk5hbWUiOiJDaG9pY2UgUGx1cyBOZXR3b3JrIiwicG9ydGFsIjoicHN4In0=';
 
 // Convert ZIP to lat/lon using free zippopotam.us API (no key required)
 function zipToLatLon(zip) {
@@ -28,7 +33,17 @@ function zipToLatLon(zip) {
   });
 }
 
-async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults = 50 } = {}) {
+/**
+ * @param {object} opts
+ * @param {string} [opts.specialty]  - e.g. "Cardiologist" (search by specialty/condition)
+ * @param {string} [opts.name]       - e.g. "Dr. Smith" or "John Smith" (search by provider name)
+ * @param {string} [opts.zip]        - 5-digit ZIP code
+ * @param {number} [opts.maxResults]
+ */
+async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {}) {
+  const searchTerm = name ? name.trim() : (specialty || 'Primary Care').trim();
+  const isNameSearch = !!name;
+
   // Resolve ZIP → lat/lon before launching browser
   let geoData;
   try {
@@ -70,22 +85,17 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
       if (!request.url().includes('ProviderSearch') || !geoData) {
         return route.continue();
       }
-
       try {
         const body = request.postDataJSON();
-
         if (body?.variables) {
           const v = body.variables;
-          // Patch location fields
           if (v.latitude !== undefined)  v.latitude  = geoData.latitude;
           if (v.longitude !== undefined) v.longitude = geoData.longitude;
           if (v.stateCode !== undefined) v.stateCode = geoData.stateCode;
-          // Patch nested searchLocation if present
           if (v.searchLocation) {
             v.searchLocation.latitude  = geoData.latitude;
             v.searchLocation.longitude = geoData.longitude;
           }
-          // Patch uniqueSearch (contains old coords)
           if (typeof v.uniqueSearch === 'string') {
             v.uniqueSearch = v.uniqueSearch.replace(
               /suggestion-[\d.-]+-[\d.-]+/,
@@ -94,7 +104,6 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
           }
           console.log(`[UHC] Patched lat/lon → ${geoData.latitude}, ${geoData.longitude}`);
         }
-
         await route.continue({ postData: JSON.stringify(body) });
       } catch (e) {
         console.log('[UHC] Route patch error:', e.message);
@@ -116,22 +125,23 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
       }
     });
 
-    // Step 1: Establish guest session
-    try {
-      await page.goto('https://findcare.guest.uhc.com/guest-plan-selection/', {
-        waitUntil: 'domcontentloaded', timeout: 20000,
-      });
-      await page.waitForTimeout(2000);
-    } catch {}
-
-    // Step 2: Navigate to find-care with zip
+    // Step 1: Navigate directly to Choice Plus Network plan
     await page.goto(
-      `https://findcare.guest.uhc.com/find-care?plan=s00001&zip=${encodeURIComponent(zip)}`,
+      `https://findcare.guest.uhc.com/guest-plan-selection/browse?deeplink=${CHOICE_PLUS_DEEPLINK}`,
       { waitUntil: 'domcontentloaded', timeout: 40000 }
-    );
-    await page.waitForTimeout(4000);
+    ).catch(() => {});
+    await page.waitForTimeout(3000);
 
-    // Step 3: Dismiss any modal
+    // If that redirected somewhere odd, try the find-care URL as fallback
+    if (!page.url().includes('findcare.guest.uhc.com')) {
+      await page.goto(
+        `https://findcare.guest.uhc.com/find-care?plan=s00001&zip=${encodeURIComponent(zip)}`,
+        { waitUntil: 'domcontentloaded', timeout: 40000 }
+      );
+      await page.waitForTimeout(3000);
+    }
+
+    // Step 2: Dismiss any modal
     await page.evaluate(() => {
       const selectors = [
         'button[aria-label="close"]', 'button[aria-label="Close"]',
@@ -142,17 +152,10 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
         const el = document.querySelector(sel);
         if (el && el.offsetParent !== null) { el.click(); return; }
       }
-      document.querySelectorAll('[role="dialog"], [class*="modal"], [class*="Modal"]').forEach(d => {
-        const btn = Array.from(d.querySelectorAll('button')).find(b =>
-          b.getAttribute('aria-label')?.toLowerCase().includes('close') ||
-          b.textContent?.toLowerCase().trim() === 'close'
-        );
-        if (btn) btn.click();
-      });
     });
     await page.waitForTimeout(1000);
 
-    // Step 4: Wait for specialty input
+    // Step 3: Find the main search combobox
     await page.waitForSelector('input[role="combobox"]', { timeout: 20000 }).catch(() => {});
 
     const allComboboxes = await page.locator('input[role="combobox"]').all();
@@ -175,38 +178,84 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
         if (!visible) continue;
         const ph = await inp.getAttribute('placeholder').catch(() => '') || '';
         if (ph.match(/zip|city|location|address/i)) continue;
-        if (ph.match(/name|specialty|doctor|provider|search/i) || ph.length > 0) {
-          searchInput = inp;
-          break;
-        }
+        searchInput = inp;
+        break;
       }
     }
 
     if (!searchInput) {
-      throw new Error('UHC: could not find specialty search input');
+      throw new Error('UHC: could not find search input');
     }
 
-    // Step 5: Type specialty and wait for GraphQL response
+    // Step 4: Type search term (name or specialty)
     const searchDone = new Promise(resolve => {
-      setTimeout(resolve, 25000);
+      setTimeout(resolve, 30000);
       const check = setInterval(() => {
         if (providerBatches.length > 0) { clearInterval(check); setTimeout(resolve, 2000); }
       }, 200);
     });
 
     await searchInput.click();
-    await searchInput.type(specialty, { delay: 80 });
+    await searchInput.fill(''); // clear any existing content
+    await searchInput.type(searchTerm, { delay: 80 });
     await page.waitForTimeout(1500);
 
+    // Step 5: Handle autocomplete dropdown
     await page.waitForSelector('[role="option"]', { timeout: 8000 }).catch(() => {});
-    const firstOption = page.locator('[role="option"]').first();
-    if (await firstOption.count() > 0) {
-      await firstOption.click();
+    const options = await page.locator('[role="option"]').all();
+
+    let clicked = false;
+    if (options.length > 0) {
+      if (isNameSearch) {
+        // For name search: look for an option that contains the name text
+        // (as opposed to specialty/condition options which show category labels)
+        const nameLower = searchTerm.toLowerCase();
+        for (const opt of options) {
+          const text = (await opt.textContent().catch(() => '')) || '';
+          const textLower = text.toLowerCase();
+          // Skip options that look like specialty categories
+          if (/specialist|condition|specialty|all providers/i.test(text)) continue;
+          // Prefer options that include parts of the typed name
+          const parts = nameLower.split(/\s+/).filter(p => p.length > 2);
+          if (parts.some(p => textLower.includes(p))) {
+            await opt.click().catch(() => {});
+            clicked = true;
+            console.log(`[UHC] Name option clicked: ${text.substring(0, 60)}`);
+            break;
+          }
+        }
+        // If no good name match, try the first option or press Enter
+        if (!clicked) {
+          const firstOpt = options[0];
+          const firstText = (await firstOpt.textContent().catch(() => '')) || '';
+          // If first option is a "search by name" or "provider" option, use it
+          if (/provider|doctor|name|search for/i.test(firstText) || options.length === 1) {
+            await firstOpt.click().catch(() => {});
+            clicked = true;
+            console.log(`[UHC] Clicked first option for name search: ${firstText.substring(0, 60)}`);
+          } else {
+            // Press Enter to submit name search directly
+            await page.keyboard.press('Enter');
+            clicked = true;
+            console.log(`[UHC] Pressed Enter for name search (no matching option found)`);
+          }
+        }
+      } else {
+        // For specialty search: click the first option (specialty/condition suggestion)
+        await options[0].click().catch(() => {});
+        clicked = true;
+        const firstText = (await options[0].textContent().catch(() => '')) || '';
+        console.log(`[UHC] Specialty option clicked: ${firstText.substring(0, 60)}`);
+      }
     } else {
       await page.keyboard.press('Enter');
+      clicked = true;
+      console.log(`[UHC] No autocomplete options; pressed Enter`);
     }
-    await page.waitForTimeout(300);
 
+    await page.waitForTimeout(500);
+
+    // Step 6: Click Search button if present
     await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find(b =>
         b.textContent?.trim().toLowerCase() === 'search' && b.offsetParent !== null
@@ -217,7 +266,7 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
     await searchDone;
     await page.waitForTimeout(2000);
 
-    // Merge and dedupe
+    // Merge and dedupe providers from all captured GraphQL batches
     const seen = new Set();
     const all = [];
     for (const batch of providerBatches) {
@@ -226,6 +275,8 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
         if (!seen.has(key)) { seen.add(key); all.push(p); }
       }
     }
+
+    console.log(`[UHC] Total providers captured: ${all.length}`);
 
     return all.slice(0, maxResults).map(p => ({
       network: 'UHC Choice Plus',
@@ -254,6 +305,7 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
       providerId: p.providerId,
       locationId: p.locationId,
     }));
+
   } finally {
     await browser.close();
   }
