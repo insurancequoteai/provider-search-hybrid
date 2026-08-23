@@ -235,7 +235,9 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
           // Prefer options that include parts of the typed name
           const parts = nameLower.split(/\s+/).filter(p => p.length > 2);
           if (parts.some(p => textLower.includes(p))) {
-            await opt.click().catch(() => {});
+            const elHandle = await opt.elementHandle().catch(() => null);
+            if (elHandle) await page.evaluate(el => el.click(), elHandle).catch(() => {});
+            else await page.keyboard.press('Enter');
             clicked = true;
             console.log(`[UHC] Name option clicked: ${text.substring(0, 60)}`);
             break;
@@ -247,7 +249,9 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
           const firstText = (await firstOpt.textContent().catch(() => '')) || '';
           // If first option is a "search by name" or "provider" option, use it
           if (/provider|doctor|name|search for/i.test(firstText) || options.length === 1) {
-            await firstOpt.click().catch(() => {});
+            const elHandle = await firstOpt.elementHandle().catch(() => null);
+            if (elHandle) await page.evaluate(el => el.click(), elHandle).catch(() => {});
+            else await page.keyboard.press('Enter');
             clicked = true;
             console.log(`[UHC] Clicked first option for name search: ${firstText.substring(0, 60)}`);
           } else {
@@ -259,9 +263,11 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
         }
       } else {
         // For specialty search: click the first option (specialty/condition suggestion)
-        await options[0].click().catch(() => {});
-        clicked = true;
         const firstText = (await options[0].textContent().catch(() => '')) || '';
+        const elHandle = await options[0].elementHandle().catch(() => null);
+        if (elHandle) await page.evaluate(el => el.click(), elHandle).catch(() => {});
+        else await page.keyboard.press('Enter');
+        clicked = true;
         console.log(`[UHC] Specialty option clicked: ${firstText.substring(0, 60)}`);
       }
     } else {
