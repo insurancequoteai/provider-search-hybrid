@@ -231,10 +231,10 @@ window.pvSearch = async function(mode) {
     pvInp.style.borderColor='#e0e3eb';
     document.getElementById('pvZipInp').style.borderColor='#e0e3eb';
   } else {
-    specialty = document.getElementById('pvDrName').value.trim();
+    var drName = document.getElementById('pvDrName').value.trim();
     zip       = document.getElementById('pvDrZip').value.trim();
     networks  = ['uhc']; // name search uses UHC's free-text search
-    if (!specialty)       { var ni=document.getElementById('pvDrName'); ni.style.borderColor='#f87171'; ni.focus(); return; }
+    if (!drName)          { var ni=document.getElementById('pvDrName'); ni.style.borderColor='#f87171'; ni.focus(); return; }
     if (zip.length < 5)   { var dzi=document.getElementById('pvDrZip'); dzi.style.borderColor='#f87171'; dzi.focus(); return; }
   }
 
@@ -250,14 +250,17 @@ window.pvSearch = async function(mode) {
 
   var t0 = Date.now();
   try {
+    var body = mode === 'spec'
+      ? { specialty: specialty, zip: zip, networks: networks }
+      : { name: drName, zip: zip, networks: networks };
     var resp = await fetch(PV_API + '/api/search', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ specialty: specialty, zip: zip, networks: networks }),
+      body: JSON.stringify(body),
     });
     if (!resp.ok) throw new Error('Server returned ' + resp.status);
     var data = await resp.json();
-    pvRender(data, specialty, zip, Date.now() - t0);
+    pvRender(data, mode === 'spec' ? specialty : drName, zip, Date.now() - t0);
   } catch (e) {
     resEl.innerHTML =
       '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:16px 18px;font-size:13px;color:#dc2626">'
