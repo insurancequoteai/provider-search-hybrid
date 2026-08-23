@@ -68,6 +68,20 @@ app.post('/api/search', async (req, res) => {
   res.json({ results, errors, durationMs: Date.now() - start });
 });
 
+// GET /api/suggest?name=Smith&zip=33701
+// Returns autocomplete provider name suggestions from UHC
+app.get('/api/suggest', async (req, res) => {
+  const { name = '', zip = '77041' } = req.query;
+  if (!name || name.length < 2) return res.json({ suggestions: [] });
+  try {
+    const suggestions = await uhc.suggest({ name, zip });
+    res.json({ suggestions });
+  } catch (e) {
+    console.error('[suggest] error:', e.message);
+    res.json({ suggestions: [], error: e.message });
+  }
+});
+
 app.get('/health', (_, res) => res.json({ ok: true }));
 
 app.listen(PORT, () => console.log(`Server running → http://localhost:${PORT}`));

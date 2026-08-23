@@ -111,21 +111,88 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
       }
     });
 
-    // Collect all GraphQL responses that contain providers (ProviderSearch OR name search queries)
+    // Collect GraphQL responses: ProviderSearch (specialty) AND AutoComplete (name search)
     page.on('response', async res => {
       const url = res.url();
       if (url.includes('graphql')) console.log(`[UHC] GraphQL hit: ${url.substring(0, 120)}`);
       if (!url.includes('findcare.guest.uhc.com/api/graphql')) return;
       try {
         const body = await res.json();
-        // ProviderSearch (specialty) — providers array
+
+        // ProviderSearch (specialty) — standard providers array
         const bySpecialty = body?.data?.providerSearch?.providers;
         if (Array.isArray(bySpecialty) && bySpecialty.length > 0) {
           console.log(`[UHC] Captured ${bySpecialty.length} providers from ProviderSearch`);
           providerBatches.push(bySpecialty);
           return;
         }
-        // Name search may use a different query key — scan all data keys
+
+        // AutoComplete response — for name search, extract provider suggestions
+        if (isNameSearch && url.includes('q=AutoComplete')) {
+          // Log full body to understand structure
+          console.log(`[UHC] AutoComplete body keys: ${JSON.stringify(Object.keys(body?.data || {}))}`);
+          console.log(`[UHC] AutoComplete raw: ${JSON.stringify(body?.data).substring(0, 600)}`);
+
+          // Try every known path for autocomplete suggestions
+          const ac = body?.data?.autoComplete;
+          const candidates = [
+            ac,
+            ac?.suggestions,
+            ac?.searchSuggestions,
+            ac?.results,
+            ac?.providers,
+            ac?.items,
+            body?.data?.suggestions,
+            body?.data?.providers,
+          ];
+
+          let list = null;
+          for (const c of candidates) {
+            if (Array.isArray(c) && c.length > 0) { list = c; break; }
+          }
+
+          // If ac itself is an object with sub-arrays, find first array
+          if (!list && ac && typeof ac === 'object') {
+            for (const k of Object.keys(ac)) {
+              if (Array.isArray(ac[k]) && ac[k].length > 0) { list = ac[k]; break; }
+            }
+          }
+
+          if (list && list.length > 0) {
+            console.log(`[UHC] AutoComplete raw sample: ${JSON.stringify(list[0]).substring(0, 300)}`);
+            const providerSuggestions = list.filter(s =>
+              s?.type === 'PROVIDER' || s?.providerName || s?.npi ||
+              s?.suggestionType === 'PROVIDER' || /provider/i.test(s?.type || '') ||
+              s?.displayText || s?.name
+            );
+            console.log(`[UHC] AutoComplete providers found: ${providerSuggestions.length} of ${list.length}`);
+            if (providerSuggestions.length > 0) {
+              const normalized = providerSuggestions.map(s => ({
+                providerName: s.providerName || s.displayText || s.name || s.text || s.label || '',
+                npi: s.npi || s.nationalProviderId || '',
+                providerId: s.providerId || s.id || '',
+                locationId: s.locationId || '',
+                providerType: s.providerType || s.type || '',
+                speciality: s.specialty || s.speciality || '',
+                specialities: s.specialties || s.specialities || [],
+                address: s.address || {},
+                phones: s.phones || {},
+                distance: s.distance,
+                latitude: s.latitude,
+                longitude: s.longitude,
+                acceptingNewPatients: s.acceptingNewPatients,
+                networkStatus: s.networkStatus || 'INN',
+                virtualIndicator: s.virtualCare ? 'Y' : 'N',
+              }));
+              providerBatches.push(normalized);
+            }
+          } else {
+            console.log(`[UHC] AutoComplete: no list found — full body: ${JSON.stringify(body).substring(0, 400)}`);
+          }
+          return;
+        }
+
+        // Fallback: scan all data keys for any providers array
         const data = body?.data;
         if (data) {
           for (const key of Object.keys(data)) {
@@ -319,4 +386,99 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
   }
 }
 
+/**
+ * Fast autocomplete — returns provider name suggestions for a partial name.
+ * Uses UHC's AutoComplete GraphQL endpoint (no full ProviderSearch needed).
+ */
+async function suggestUHC({ name, zip = '77041' } = {}) {
+  let geoData;
+  try { geoData = await zipToLatLon(zip); } catch (e) { geoData = null; }
+
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--no-zygote','--single-process'],
+  });
+
+  try {
+    const context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      locale: 'en-US',
+      viewport: { width: 1280, height: 900 },
+    });
+    const page = await context.newPage();
+    page.setDefaultTimeout(30000);
+
+    let suggestions = [];
+
+    page.on('response', async res => {
+      if (!res.url().includes('findcare.guest.uhc.com/api/graphql')) return;
+      if (!res.url().includes('q=AutoComplete')) return;
+      try {
+        const body = await res.json();
+        const ac = body?.data?.autoComplete;
+        const candidates = [ac, ac?.suggestions, ac?.searchSuggestions, ac?.results, ac?.items, body?.data?.suggestions];
+        let list = null;
+        for (const c of candidates) {
+          if (Array.isArray(c) && c.length > 0) { list = c; break; }
+        }
+        if (!list && ac && typeof ac === 'object') {
+          for (const k of Object.keys(ac)) {
+            if (Array.isArray(ac[k]) && ac[k].length > 0) { list = ac[k]; break; }
+          }
+        }
+        if (list) {
+          console.log(`[UHC suggest] AutoComplete raw: ${JSON.stringify(list[0]).substring(0, 200)}`);
+          suggestions = list.map(s => ({
+            providerName: s.providerName || s.displayText || s.name || s.text || s.label || '',
+            npi: s.npi || '',
+            providerId: s.providerId || s.id || '',
+            locationId: s.locationId || '',
+            specialty: s.specialty || s.speciality || '',
+            type: s.type || s.suggestionType || '',
+            address: s.address || {},
+          })).filter(s => s.providerName);
+        } else {
+          console.log(`[UHC suggest] AutoComplete body: ${JSON.stringify(body?.data).substring(0, 400)}`);
+        }
+      } catch {}
+    });
+
+    await page.goto('https://findcare.guest.uhc.com/guest-plan-selection/', { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+    await page.goto(`https://findcare.guest.uhc.com/find-care?plan=s00001&zip=${encodeURIComponent(zip)}`, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(3000);
+
+    await page.evaluate(() => {
+      const selectors = ['button[aria-label="close"]','button[aria-label="Close"]','[data-testid="modal-close"]','.abyss-icon-button'];
+      for (const sel of selectors) { const el = document.querySelector(sel); if (el && el.offsetParent !== null) { el.click(); return; } }
+    });
+    await page.waitForTimeout(500);
+
+    await page.waitForSelector('input[role="combobox"]', { timeout: 15000 }).catch(() => {});
+    const allComboboxes = await page.locator('input[role="combobox"]').all();
+    let searchInput = null;
+    for (const cb of allComboboxes) {
+      const visible = await cb.isVisible().catch(() => false);
+      if (!visible) continue;
+      const ph = await cb.getAttribute('placeholder').catch(() => '') || '';
+      if (ph.match(/zip|city|location|address/i)) continue;
+      searchInput = cb; break;
+    }
+    if (!searchInput) throw new Error('UHC suggest: no search input found');
+
+    await page.evaluate(el => { el.click(); el.focus(); }, await searchInput.elementHandle());
+    await page.waitForTimeout(200);
+    await page.keyboard.type(name, { delay: 80 });
+
+    // Wait up to 6s for AutoComplete response
+    await page.waitForTimeout(6000);
+
+    console.log(`[UHC suggest] Returning ${suggestions.length} suggestions for "${name}"`);
+    return suggestions;
+  } finally {
+    await browser.close();
+  }
+}
+
 module.exports = searchUHC;
+module.exports.suggest = suggestUHC;

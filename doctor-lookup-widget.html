@@ -86,8 +86,13 @@
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
         <div class="field">
           <label>Doctor's Name</label>
-          <input type="text" id="pvDrName" placeholder="e.g. John Smith or Smith"
-            style="width:100%;padding:9px 12px;border:1px solid #e0e3eb;border-radius:8px;font-size:14px;background:#fff;color:#1a1a2e;outline:none;font-family:inherit;box-sizing:border-box">
+          <div style="position:relative">
+            <input type="text" id="pvDrName" placeholder="e.g. John Smith or Smith"
+              autocomplete="off" spellcheck="false"
+              style="width:100%;padding:9px 12px;border:1px solid #e0e3eb;border-radius:8px;font-size:14px;background:#fff;color:#1a1a2e;outline:none;font-family:inherit;box-sizing:border-box">
+            <div id="pvDrDrp"
+              style="display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;background:#fff;border:1px solid #e0e3eb;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.1);z-index:300;overflow:hidden;max-height:220px;overflow-y:auto"></div>
+          </div>
         </div>
         <div class="field">
           <label>ZIP Code</label>
@@ -193,6 +198,58 @@ pvInp.addEventListener('focus', pvShowDrop);
 document.addEventListener('click', function(e) {
   if (!pvInp.contains(e.target) && !pvDrp.contains(e.target)) {
     pvDrp.style.display = 'none';
+  }
+});
+
+// ── DOCTOR NAME AUTOCOMPLETE ──────────────────────────────────────────────
+var pvDrNameInp = document.getElementById('pvDrName');
+var pvDrDrp     = document.getElementById('pvDrDrp');
+var pvDrTimer   = null;
+var pvDrLoading = false;
+
+function pvShowDrDrop(items) {
+  if (!items || !items.length) { pvDrDrp.style.display = 'none'; return; }
+  pvDrDrp.innerHTML = items.map(function(s) {
+    var name = s.providerName || s.name || '';
+    var spec = s.specialty || '';
+    var addr = s.address ? [s.address.city, s.address.state].filter(Boolean).join(', ') : '';
+    return '<div class="_pvdri" data-name="' + name.replace(/"/g,'&quot;') + '"'
+      + ' style="padding:9px 14px;cursor:pointer;border-bottom:1px solid #f3f4f6">'
+      + '<div style="font-size:13px;font-weight:600;color:#1a1a2e">' + name + '</div>'
+      + (spec ? '<div style="font-size:11px;color:#6b7280;margin-top:2px">' + spec + (addr ? ' · ' + addr : '') + '</div>' : '')
+      + '</div>';
+  }).join('');
+  pvDrDrp.querySelectorAll('._pvdri').forEach(function(el) {
+    el.addEventListener('mouseenter', function() { el.style.background = '#f0f9ff'; });
+    el.addEventListener('mouseleave', function() { el.style.background = ''; });
+    el.addEventListener('mousedown', function(e) {
+      e.preventDefault();
+      pvDrNameInp.value = el.dataset.name;
+      pvDrDrp.style.display = 'none';
+    });
+  });
+  pvDrDrp.style.display = 'block';
+}
+
+pvDrNameInp.addEventListener('input', function() {
+  clearTimeout(pvDrTimer);
+  var q = pvDrNameInp.value.trim();
+  if (q.length < 2) { pvDrDrp.style.display = 'none'; return; }
+  // Show loading placeholder
+  pvDrDrp.innerHTML = '<div style="padding:10px 14px;font-size:12px;color:#9ca3af">Searching providers…</div>';
+  pvDrDrp.style.display = 'block';
+  pvDrTimer = setTimeout(function() {
+    var zip = document.getElementById('pvDrZip').value.trim() || '77041';
+    fetch(PV_API + '/api/suggest?name=' + encodeURIComponent(q) + '&zip=' + encodeURIComponent(zip))
+      .then(function(r) { return r.json(); })
+      .then(function(d) { pvShowDrDrop(d.suggestions || []); })
+      .catch(function() { pvDrDrp.style.display = 'none'; });
+  }, 400);
+});
+
+document.addEventListener('click', function(e) {
+  if (!pvDrNameInp.contains(e.target) && !pvDrDrp.contains(e.target)) {
+    pvDrDrp.style.display = 'none';
   }
 });
 
