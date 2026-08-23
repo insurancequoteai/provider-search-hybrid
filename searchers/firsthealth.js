@@ -101,7 +101,66 @@ module.exports = async function firsthealthSearch({ zip, name, specialty, npi } 
     await page.waitForTimeout(2000);
 
     // ── STEP 3: Fill search form ───────────────────────────────────────────
+    // IMPORTANT: ZIP must be entered FIRST — the #specialities dropdown is
+    // empty on page load and is AJAX-populated only after ZIP is entered.
 
+    // 3a. Enter ZIP (triggers AJAX to populate #specialities and county/city)
+    if (zip && zip.trim()) {
+      await page.evaluate((z) => {
+        const el = document.querySelector('#txtboxZipCode');
+        if (!el) return;
+        el.value = z;
+        el.dispatchEvent(new Event('input',  { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('blur',   { bubbles: true }));
+      }, zip.trim());
+      // Also try slow-type into the field as a fallback trigger
+      await page.click('#txtboxZipCode', { clickCount: 3 }).catch(() => {});
+      await page.keyboard.type(zip.trim(), { delay: 60 }).catch(() => {});
+      await page.dispatchEvent('#txtboxZipCode', 'change').catch(() => {});
+      await page.dispatchEvent('#txtboxZipCode', 'blur').catch(() => {});
+
+      // Wait for #specialities to be populated (AJAX-driven)
+      const specialtiesLoaded = await page.evaluate(() => {
+        return new Promise(resolve => {
+          let tries = 0;
+          const poll = setInterval(() => {
+            const sel = document.querySelector('#specialities');
+            if ((sel && sel.options.length > 1) || tries++ > 30) {
+              clearInterval(poll);
+              resolve(sel ? sel.options.length : 0);
+            }
+          }, 300);
+        });
+      });
+      console.log(`[FH] #specialities options after ZIP: ${specialtiesLoaded}`);
+      await page.waitForTimeout(500);
+    }
+
+    // 3b. Specialty — select from #specialities (correct ID, AJAX-populated)
+    if (specialty && specialty.trim()) {
+      const spec = specialty.trim();
+      const matched = await page.evaluate((kw) => {
+        const sel = document.querySelector('#specialities');
+        if (!sel || sel.options.length <= 1) return null;
+        const opts = Array.from(sel.options);
+        const kl = kw.toLowerCase();
+        const exact   = opts.find(o => o.text.trim().toLowerCase() === kl);
+        const partial = opts.find(o => o.text.trim().toLowerCase().includes(kl));
+        const reverse = opts.find(o => o.text.trim().length > 3 && kl.includes(o.text.trim().toLowerCase()));
+        const opt = exact || partial || reverse;
+        if (opt) {
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+          return opt.text.trim();
+        }
+        return null;
+      }, spec);
+      console.log(`[FH] Specialty matched: ${matched}`);
+      await page.waitForTimeout(400);
+    }
+
+    // 3c. Provider name (optional)
     if (name && name.trim()) {
       let nameQuery = name.trim();
       if (!nameQuery.includes(',')) {
@@ -113,40 +172,9 @@ module.exports = async function firsthealthSearch({ zip, name, specialty, npi } 
       await jsfill(page, '#txtProviderName', nameQuery);
     }
 
+    // 3d. NPI (optional)
     if (npi && npi.trim()) {
       await jsfill(page, '#txtProviderNPI', npi.trim());
-    }
-
-    if (specialty && specialty.trim()) {
-      const spec = specialty.trim();
-      const selectEl = page.locator('select#selectedSpeciality, select[name*="pecial" i]').first();
-      if (await selectEl.count() > 0) {
-        const matched = await selectEl.evaluate((el, kw) => {
-          const opts = Array.from(el.options);
-          const exact = opts.find(o => o.text.toLowerCase() === kw.toLowerCase());
-          const partial = opts.find(o => o.text.toLowerCase().includes(kw.toLowerCase()));
-          // Also try reverse: keyword contains option text
-          const reverse = opts.find(o => o.text.length > 3 && kw.toLowerCase().includes(o.text.toLowerCase()));
-          const opt = exact || partial || reverse;
-          if (opt) {
-            el.value = opt.value;
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            return opt.text;
-          }
-          return null;
-        }, spec);
-        console.log(`[FH] Specialty matched: ${matched}`);
-      } else {
-        await jsfill(page, '#selectedSpeciality', spec);
-      }
-      await page.waitForTimeout(500);
-    }
-
-    if (zip && zip.trim()) {
-      await jsfill(page, '#txtboxZipCode', zip.trim());
-      await page.dispatchEvent('#txtboxZipCode', 'change').catch(() => {});
-      await page.dispatchEvent('#txtboxZipCode', 'blur').catch(() => {});
-      await page.waitForTimeout(1000);
     }
 
     // ── Click Search ───────────────────────────────────────────────────────
