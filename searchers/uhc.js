@@ -233,22 +233,47 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
                 return;
               }
             }
-            // Deep scan: log structure so we can fix it, and try any array with 2+ items
+            // Target careTeamProviders directly — confirmed key from logs
             const inner = data.getCareTeamPaginated || data.careTeam || data.providerSearch || {};
-            const sectionKeys = Object.keys(inner);
-            console.log(`[UHC] GetCareTeamPaginated inner keys: ${sectionKeys.join(', ')}`);
-            for (const k of sectionKeys) {
-              const v = inner[k];
-              if (Array.isArray(v) && v.length > 0) {
-                console.log(`[UHC] GetCareTeamPaginated found array at "${k}": ${v.length} items, first keys: ${Object.keys(v[0] || {}).slice(0, 6).join(', ')}`);
-                if (v[0]?.providerName || v[0]?.displayName || v[0]?.npi) {
-                  providerBatches.push(v);
-                  paginatedResolved = true;
-                  return;
-                }
-              }
+            const careTeamProviders = inner.careTeamProviders;
+            if (Array.isArray(careTeamProviders) && careTeamProviders.length > 0) {
+              const firstKeys = Object.keys(careTeamProviders[0] || {}).slice(0, 10).join(', ');
+              console.log(`[UHC] careTeamProviders[0] keys: ${firstKeys}`);
+              // Normalize careTeamProviders items to match ProviderSearch shape
+              const normalized = careTeamProviders.map(p => {
+                // Try both possible field name patterns
+                const addr = p.address || p.providerAddress || {};
+                return {
+                  providerName: p.providerName || p.displayName || p.name || `${p.firstName || ''} ${p.lastName || ''}`.trim(),
+                  npi: p.npi || p.providerNpi || '',
+                  providerId: p.providerId || p.id || '',
+                  locationId: p.locationId || '',
+                  providerType: p.providerType || p.type || '',
+                  speciality: p.speciality || p.specialty || p.specialties?.[0] || '',
+                  specialities: p.specialities || (p.specialty ? [{ value: p.specialty }] : []),
+                  address: {
+                    line: addr.line || (addr.street ? [addr.street] : []),
+                    city: addr.city || '',
+                    state: addr.state || addr.stateCode || '',
+                    postalCode: addr.postalCode || addr.zip || '',
+                  },
+                  phones: p.phones || {},
+                  distance: p.distance || null,
+                  latitude: p.latitude || null,
+                  longitude: p.longitude || null,
+                  acceptingNewPatients: p.acceptingNewPatients === true,
+                  virtualIndicator: p.virtualIndicator || 'N',
+                  networkStatus: p.networkStatus || 'INN',
+                  recommendationDetails: p.recommendationDetails || null,
+                  healthGradeRating: p.healthGradeRating || null,
+                };
+              });
+              console.log(`[UHC] GetCareTeamPaginated: ${normalized.length} providers via careTeamProviders`);
+              providerBatches.push(normalized);
+              paginatedResolved = true;
+              return;
             }
-            console.log(`[UHC] GetCareTeamPaginated: still unmatched. data keys: ${Object.keys(data).join(', ')}`);
+            console.log(`[UHC] GetCareTeamPaginated: careTeamProviders missing. inner keys: ${Object.keys(inner).join(', ')}`);
           }
           paginatedResolved = true; // mark done even if empty so we don't hang
           return;
