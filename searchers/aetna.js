@@ -87,53 +87,99 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
     await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
 
     if (isNameSearch) {
-      // ── Name search: find the "Search by Provider Name" option ───────────────
-      // After plan selection Aetna shows category tiles; there's a name/keyword input
-      // on the main providerSearch page or a dedicated "By Provider Name" tile
-      await page.waitForTimeout(800);
+      // ── Name search ───────────────────────────────────────────────────────────
+      await page.waitForTimeout(1200);
+
+      // DEBUG: dump current URL and all visible clickable text + all inputs
+      const debugInfo = await page.evaluate(() => {
+        const url = location.href;
+        const tiles = Array.from(document.querySelectorAll('a, button, li, span, div[role="button"], div[ng-click]'))
+          .filter(el => el.offsetParent !== null)
+          .map(el => el.textContent?.trim().replace(/\s+/g,' ').substring(0, 60))
+          .filter(t => t && t.length > 2)
+          .filter((t, i, a) => a.indexOf(t) === i)
+          .slice(0, 40);
+        const inputs = Array.from(document.querySelectorAll('input'))
+          .filter(el => el.offsetParent !== null)
+          .map(el => ({
+            type: el.type, placeholder: el.placeholder,
+            ngModel: el.getAttribute('ng-model'), ariaLabel: el.getAttribute('aria-label'),
+            id: el.id, name: el.name
+          }));
+        return { url, tiles, inputs };
+      });
+      console.log('[Aetna] URL after Continue:', debugInfo.url);
+      console.log('[Aetna] Visible tiles:', JSON.stringify(debugInfo.tiles));
+      console.log('[Aetna] Visible inputs:', JSON.stringify(debugInfo.inputs));
 
       const responsePromise = page.waitForResponse(
         res => res.url().includes('publicdse_providersearch'),
         { timeout: 30000 }
       ).catch(() => null);
 
-      // Try clicking "Search by Name" / "Provider Name" tile if visible
+      // Try clicking any "name / keyword" tile
       const nameTileClicked = await page.evaluate(() => {
         const els = Array.from(document.querySelectorAll('a, button, li, span, div[role="button"], div[ng-click]'));
         const tile = els.find(el => el.offsetParent !== null && (
-          /provider name|search by name|find a doctor by name/i.test(el.textContent || '')
+          /provider name|search by name|find a doctor by name|by name|keyword/i.test(el.textContent || '')
         ));
-        if (tile) { tile.click(); return 'name-tile'; }
+        if (tile) { tile.click(); return tile.textContent?.trim().substring(0,50); }
         return null;
       });
-      console.log(`[Aetna] Name tile: ${nameTileClicked}`);
+      console.log(`[Aetna] Name tile clicked: ${nameTileClicked}`);
 
       if (!nameTileClicked) {
         // Fallback: click Medical Doctors then look for a name input there
-        await page.evaluate(() => {
-          Array.from(document.querySelectorAll('a, button, li, span'))
-            .find(el => el.offsetParent !== null && el.textContent?.includes('Medical Doctors'))?.click();
+        const medClicked = await page.evaluate(() => {
+          const el = Array.from(document.querySelectorAll('a, button, li, span'))
+            .find(el => el.offsetParent !== null && el.textContent?.includes('Medical Doctors'));
+          if (el) { el.click(); return el.textContent?.trim(); }
+          return null;
         });
+        console.log(`[Aetna] Med doctors clicked: ${medClicked}`);
         await page.waitForURL('**/providerMedical**', { timeout: 12000 }).catch(() => {});
         await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
-        await page.waitForTimeout(600);
+        await page.waitForTimeout(800);
+
+        // DEBUG again on medical page
+        const debugMed = await page.evaluate(() => {
+          const inputs = Array.from(document.querySelectorAll('input'))
+            .filter(el => el.offsetParent !== null)
+            .map(el => ({
+              type: el.type, placeholder: el.placeholder,
+              ngModel: el.getAttribute('ng-model'), ariaLabel: el.getAttribute('aria-label'),
+              id: el.id, name: el.name
+            }));
+          const tiles = Array.from(document.querySelectorAll('a, button, li, span'))
+            .filter(el => el.offsetParent !== null)
+            .map(el => el.textContent?.trim().replace(/\s+/g,' ').substring(0,50))
+            .filter(t => t && t.length > 2)
+            .filter((t,i,a) => a.indexOf(t)===i)
+            .slice(0,30);
+          return { url: location.href, inputs, tiles };
+        });
+        console.log('[Aetna] Med page URL:', debugMed.url);
+        console.log('[Aetna] Med page inputs:', JSON.stringify(debugMed.inputs));
+        console.log('[Aetna] Med page tiles:', JSON.stringify(debugMed.tiles));
       }
 
       // Find the provider name input and type the name
       await page.waitForTimeout(600);
       const nameInputFound = await page.evaluate((providerName) => {
-        const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
-        const inp = inputs.find(el => el.offsetParent !== null && (
+        // Try any visible input — match by placeholder/ng-model/aria-label, or take first text input
+        const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'))
+          .filter(el => el.offsetParent !== null);
+        const inp = inputs.find(el =>
           /name|provider|doctor|keyword|search/i.test(el.placeholder || '') ||
           /name|provider|doctor|keyword/i.test(el.getAttribute('ng-model') || '') ||
           /name|provider|doctor/i.test(el.getAttribute('aria-label') || '')
-        ));
+        ) || inputs[0]; // fallback: first visible text input
         if (inp) {
           inp.value = providerName;
           inp.dispatchEvent(new Event('input', { bubbles: true }));
           inp.dispatchEvent(new Event('change', { bubbles: true }));
           inp.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-          return inp.placeholder || inp.getAttribute('ng-model') || 'found';
+          return inp.placeholder || inp.getAttribute('ng-model') || inp.id || 'found';
         }
         return null;
       }, name);
