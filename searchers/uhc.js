@@ -221,72 +221,53 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
     await page.keyboard.type(searchTerm, { delay: 80 });
     await page.waitForTimeout(1500);
 
-    // Step 6: Handle autocomplete dropdown
+    // Step 6: Handle autocomplete dropdown via keyboard navigation
+    // ArrowDown/Enter trigger React's synthetic handlers properly unlike JS el.click()
     await page.waitForSelector('[role="option"]', { timeout: 8000 }).catch(() => {});
     const options = await page.locator('[role="option"]').all();
     console.log(`[UHC] Autocomplete options found: ${options.length}`);
 
-    let clicked = false;
     if (options.length > 0) {
       if (isNameSearch) {
-        // For name search: look for an option that contains the name text
-        // (as opposed to specialty/condition options which show category labels)
+        // For name search: find which index best matches the name
         const nameLower = searchTerm.toLowerCase();
-        for (const opt of options) {
-          const text = (await opt.textContent().catch(() => '')) || '';
+        let targetIndex = 0;
+        for (let i = 0; i < options.length; i++) {
+          const text = (await options[i].textContent().catch(() => '')) || '';
           const textLower = text.toLowerCase();
-          // Skip options that look like specialty categories
           if (/specialist|condition|specialty|all providers/i.test(text)) continue;
-          // Prefer options that include parts of the typed name
           const parts = nameLower.split(/\s+/).filter(p => p.length > 2);
           if (parts.some(p => textLower.includes(p))) {
-            const elHandle = await opt.elementHandle().catch(() => null);
-            if (elHandle) await page.evaluate(el => el.click(), elHandle).catch(() => {});
-            else await page.keyboard.press('Enter');
-            clicked = true;
-            console.log(`[UHC] Name option clicked: ${text.substring(0, 60)}`);
+            targetIndex = i;
+            console.log(`[UHC] Name option matched at index ${i}: ${text.substring(0, 60)}`);
             break;
           }
         }
-        // If no good name match, try the first option or press Enter
-        if (!clicked) {
-          const firstOpt = options[0];
-          const firstText = (await firstOpt.textContent().catch(() => '')) || '';
-          // If first option is a "search by name" or "provider" option, use it
-          if (/provider|doctor|name|search for/i.test(firstText) || options.length === 1) {
-            const elHandle = await firstOpt.elementHandle().catch(() => null);
-            if (elHandle) await page.evaluate(el => el.click(), elHandle).catch(() => {});
-            else await page.keyboard.press('Enter');
-            clicked = true;
-            console.log(`[UHC] Clicked first option for name search: ${firstText.substring(0, 60)}`);
-          } else {
-            // Press Enter to submit name search directly
-            await page.keyboard.press('Enter');
-            clicked = true;
-            console.log(`[UHC] Pressed Enter for name search (no matching option found)`);
-          }
+        for (let i = 0; i <= targetIndex; i++) {
+          await page.keyboard.press('ArrowDown');
+          await page.waitForTimeout(80);
         }
+        await page.keyboard.press('Enter');
+        console.log(`[UHC] Name option selected via keyboard (index ${targetIndex})`);
       } else {
-        // For specialty search: click the first option (specialty/condition suggestion)
+        // Specialty: arrow to first option and select
         const firstText = (await options[0].textContent().catch(() => '')) || '';
-        const elHandle = await options[0].elementHandle().catch(() => null);
-        if (elHandle) await page.evaluate(el => el.click(), elHandle).catch(() => {});
-        else await page.keyboard.press('Enter');
-        clicked = true;
-        console.log(`[UHC] Specialty option clicked: ${firstText.substring(0, 60)}`);
+        await page.keyboard.press('ArrowDown');
+        await page.waitForTimeout(150);
+        await page.keyboard.press('Enter');
+        console.log(`[UHC] Specialty option selected via keyboard: ${firstText.substring(0, 60)}`);
       }
     } else {
       await page.keyboard.press('Enter');
-      clicked = true;
       console.log(`[UHC] No autocomplete options; pressed Enter`);
     }
 
-    await page.waitForTimeout(500);
+    // Wait for React to process the selection
+    await page.waitForTimeout(800);
 
-    // Step 7: Click Search button (try multiple patterns, fall back to Enter)
+    // Step 7: Submit the search (button first, then Enter as fallback)
     const searchBtnFound = await page.evaluate(() => {
       const btns = Array.from(document.querySelectorAll('button'));
-      // Try exact "search" text, then any button containing "search" or "find"
       const btn = btns.find(b => b.textContent?.trim().toLowerCase() === 'search' && b.offsetParent !== null)
         || btns.find(b => /search|find|go/i.test(b.textContent?.trim()) && b.offsetParent !== null && b.type !== 'reset')
         || btns.find(b => b.getAttribute('aria-label') && /search|find/i.test(b.getAttribute('aria-label')) && b.offsetParent !== null);
@@ -295,9 +276,8 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
     });
     console.log(`[UHC] Search button: ${searchBtnFound}`);
     if (!searchBtnFound) {
-      // No button found — press Enter to submit
       await page.keyboard.press('Enter');
-      console.log('[UHC] Search button not found, pressed Enter');
+      console.log('[UHC] No search button, pressed Enter to submit');
     }
 
     await searchDone;
