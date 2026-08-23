@@ -140,40 +140,20 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
       } catch {}
     });
 
-    // Step 1: Navigate via Choice Plus deeplink → lands on ZIP/location page
+    // Step 1: Establish guest session (required before find-care URL works)
     await page.goto(
-      `https://findcare.guest.uhc.com/guest-plan-selection/browse?deeplink=${CHOICE_PLUS_DEEPLINK}`,
+      'https://findcare.guest.uhc.com/guest-plan-selection/',
+      { waitUntil: 'domcontentloaded', timeout: 25000 }
+    ).catch(() => {});
+    await page.waitForTimeout(2000);
+
+    // Step 2: Navigate directly to find-care with ZIP (proven working URL)
+    await page.goto(
+      `https://findcare.guest.uhc.com/find-care?plan=s00001&zip=${encodeURIComponent(zip)}`,
       { waitUntil: 'domcontentloaded', timeout: 40000 }
     ).catch(() => {});
-    await page.waitForTimeout(2500);
-    console.log(`[UHC] After deeplink nav: ${page.url()}`);
-
-    // Step 2: Type ZIP → a location dropdown appears → click the first suggestion
-    // (This is an autocomplete, NOT a form submit button)
-    const zipInput = page.locator('input').first();
-    await zipInput.click({ timeout: 8000 }).catch(() => {});
-    await zipInput.fill(zip).catch(async () => {
-      // fallback: type character by character
-      await page.keyboard.type(zip, { delay: 80 });
-    });
-    await page.waitForTimeout(1200);
-
-    // Wait for location dropdown options and click the first one
-    await page.waitForSelector('[role="option"], [role="listbox"] li, ul[class*="suggest"] li', {
-      timeout: 10000,
-    }).catch(() => {});
-
-    const locationOption = page.locator('[role="option"]').first();
-    if (await locationOption.count() > 0) {
-      await locationOption.click();
-      console.log(`[UHC] Clicked location dropdown option for ZIP ${zip}`);
-    } else {
-      // Fallback: press Enter
-      await page.keyboard.press('Enter');
-      console.log(`[UHC] No location dropdown — pressed Enter`);
-    }
-    await page.waitForTimeout(3000);
-    console.log(`[UHC] After ZIP selection: ${page.url()}`);
+    await page.waitForTimeout(4000);
+    console.log(`[UHC] find-care loaded: ${page.url()}`);
 
     // Step 3: Dismiss any modal
     await page.evaluate(() => {
