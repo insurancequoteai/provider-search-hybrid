@@ -15,6 +15,16 @@ async function jsfill(page, selector, value) {
   }, [selector, value]);
 }
 
+// Poll for URL fragment instead of waitForURL (more reliable on cloud)
+async function waitForUrlContains(page, fragment, timeout = 20000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (page.url().includes(fragment)) return true;
+    await page.waitForTimeout(400);
+  }
+  return false;
+}
+
 module.exports = async function firsthealthSearch({ zip, name, specialty, npi } = {}) {
   const browser = await chromium.launch({
     headless: true,
@@ -33,8 +43,9 @@ module.exports = async function firsthealthSearch({ zip, name, specialty, npi } 
       'https://providerlocator.firsthealth.com/LocateProvider/LocateProviderSearch/',
       { waitUntil: 'domcontentloaded', timeout: 30000 }
     );
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000);
 
+    // Select First Health radio and click submit
     await page.evaluate(() => {
       const radios = Array.from(document.querySelectorAll('input[type="radio"][name="RadioButtonSelected"]'));
       const fh = radios.find(r => {
@@ -42,36 +53,46 @@ module.exports = async function firsthealthSearch({ zip, name, specialty, npi } 
         return label && label.textContent.includes('First Health') && !label.textContent.includes('Choice');
       }) || radios[0];
       if (fh) fh.click();
-      const btn = document.querySelector('#btnSubmit');
-      if (btn) btn.click();
     });
+    await page.waitForTimeout(500);
 
-    await page.waitForURL('**/ProviderTypeSelection/**', { timeout: 15000 });
-    await page.waitForTimeout(1000);
+    // Use locator click for submit — more reliable than evaluate click for navigation
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
+      page.locator('#btnSubmit').click(),
+    ]);
+
+    const onTypeSelection = await waitForUrlContains(page, 'ProviderTypeSelection', 15000);
+    if (!onTypeSelection) {
+      console.log('[FH] Step 1 navigation may have stalled, current URL:', page.url());
+    }
+    await page.waitForTimeout(1500);
 
     // ── STEP 2: Provider type = Physician ─────────────────────────────────
     const physicianLabel = page.locator('div#Physician label.btn').first();
     if (await physicianLabel.count() > 0) {
       await physicianLabel.click();
     } else {
-      // Fallback: click any label containing "Physician"
       await page.locator('label:has-text("Physician")').first().click().catch(() => {});
     }
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(500);
 
     await page.evaluate(() => {
       const cb = document.querySelector('#AcceptingNewPatients');
       if (cb && !cb.checked) cb.click();
     });
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(400);
 
-    await page.locator('#btnSubmit').click();
-    await page.waitForURL('**/SearchIndex/**', { timeout: 15000 });
-    await page.waitForTimeout(1500);
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
+      page.locator('#btnSubmit').click(),
+    ]);
+
+    await waitForUrlContains(page, 'SearchIndex', 15000);
+    await page.waitForTimeout(2000);
 
     // ── STEP 3: Fill search form ───────────────────────────────────────────
 
-    // Provider name
     if (name && name.trim()) {
       let nameQuery = name.trim();
       if (!nameQuery.includes(',')) {
@@ -83,38 +104,36 @@ module.exports = async function firsthealthSearch({ zip, name, specialty, npi } 
       await jsfill(page, '#txtProviderName', nameQuery);
     }
 
-    // NPI
     if (npi && npi.trim()) {
       await jsfill(page, '#txtProviderNPI', npi.trim());
     }
 
-    // Specialty — try dropdown first, then text input
     if (specialty && specialty.trim()) {
       const spec = specialty.trim();
-
-      // Try selecting from a <select> dropdown
       const selectEl = page.locator('select#selectedSpeciality, select[name*="pecial" i]').first();
       if (await selectEl.count() > 0) {
-        // Find best matching option
         const matched = await selectEl.evaluate((el, kw) => {
           const opts = Array.from(el.options);
           const exact = opts.find(o => o.text.toLowerCase() === kw.toLowerCase());
           const partial = opts.find(o => o.text.toLowerCase().includes(kw.toLowerCase()));
-          const opt = exact || partial;
-          if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); return opt.text; }
+          // Also try reverse: keyword contains option text
+          const reverse = opts.find(o => o.text.length > 3 && kw.toLowerCase().includes(o.text.toLowerCase()));
+          const opt = exact || partial || reverse;
+          if (opt) {
+            el.value = opt.value;
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return opt.text;
+          }
           return null;
         }, spec);
         console.log(`[FH] Specialty matched: ${matched}`);
       } else {
-        // Fall back to text fill
         await jsfill(page, '#selectedSpeciality', spec);
       }
       await page.waitForTimeout(500);
     }
 
-    // ZIP code
     if (zip && zip.trim()) {
-      await page.click('#txtboxZipCode', { clickCount: 3 }).catch(() => {});
       await jsfill(page, '#txtboxZipCode', zip.trim());
       await page.dispatchEvent('#txtboxZipCode', 'change').catch(() => {});
       await page.dispatchEvent('#txtboxZipCode', 'blur').catch(() => {});
@@ -122,25 +141,20 @@ module.exports = async function firsthealthSearch({ zip, name, specialty, npi } 
     }
 
     // ── Click Search ───────────────────────────────────────────────────────
-    const searchBtn = page.locator('#SearchNow').first();
-    if (await searchBtn.count() > 0) {
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
-        searchBtn.click(),
-      ]);
-    } else {
-      // Fallback: JS click
-      await page.evaluate(() => {
-        const btn = document.querySelector('#SearchNow') ||
-          Array.from(document.querySelectorAll('button,input[type="submit"]'))
-            .find(b => /search/i.test(b.textContent || b.value));
-        if (btn) btn.click();
-      });
-      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
-    }
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {}),
+      page.locator('#SearchNow').first().click().catch(async () => {
+        // Fallback if #SearchNow not visible
+        await page.evaluate(() => {
+          const btn = document.querySelector('#SearchNow') ||
+            Array.from(document.querySelectorAll('button,input[type="submit"]'))
+              .find(b => /search/i.test(b.textContent || b.value));
+          if (btn) btn.click();
+        });
+      }),
+    ]);
 
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000);
 
     // ── STEP 4: Scrape results ─────────────────────────────────────────────
     const pageText = await page.evaluate(() => document.body.innerText);
