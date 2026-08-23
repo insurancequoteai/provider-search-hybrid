@@ -1,22 +1,59 @@
 // searchers/aetna.js
 // Aetna Open Choice PPO provider search via Playwright + stealth
-// Full navigation: landing → zip → plan → Medical Doctors → Medical Specialists → results
 
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
 
-/**
- * @param {object} opts
- * @param {string} opts.specialty  - e.g. "Cardiologist", "All Medical Specialists", "Dermatologist"
- * @param {string} opts.zip        - 5-digit ZIP code
- * @param {number} [opts.maxResults=25]
- * @returns {Promise<Array>} normalized provider objects
- */
+// Normalize common user search terms to Aetna's specialty page labels
+const SPECIALTY_ALIASES = {
+  'cardiologist':       'cardiology',
+  'dermatologist':      'dermatology',
+  'neurologist':        'neurology',
+  'oncologist':         'oncology',
+  'ophthalmologist':    'ophthalmology',
+  'orthopedic':         'orthopedic',
+  'orthopedist':        'orthopedic',
+  'psychiatrist':       'psychiatry',
+  'psychologist':       'psychology',
+  'urologist':          'urology',
+  'endocrinologist':    'endocrinology',
+  'gastroenterologist': 'gastroenterology',
+  'hematologist':       'hematology',
+  'nephrologist':       'nephrology',
+  'pulmonologist':      'pulmonology',
+  'rheumatologist':     'rheumatology',
+  'allergist':          'allergy',
+  'immunologist':       'immunology',
+  'obstetrician':       'obstetrics',
+  'gynecologist':       'gynecology',
+  'pediatrician':       'pediatrics',
+  'radiologist':        'radiology',
+  'anesthesiologist':   'anesthesiology',
+};
+
+function normalizeSpecialty(raw) {
+  const lower = raw.toLowerCase().trim();
+  return SPECIALTY_ALIASES[lower] || lower;
+}
+
+// True if element text matches the specialty (tries exact, alias, stem, reverse)
+function specialtyMatches(elText, targetLower, normalizedTarget) {
+  const el = elText.toLowerCase().trim();
+  return (
+    el === targetLower ||
+    el === normalizedTarget ||
+    el.includes(normalizedTarget) ||
+    el.includes(targetLower) ||
+    normalizedTarget.includes(el) ||
+    targetLower.includes(el)
+  );
+}
+
 async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041', maxResults = 25 } = {}) {
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   });
 
   try {
@@ -28,12 +65,14 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
     });
 
     let providerApiBody = null;
-
     page.on('response', async res => {
       if (res.url().includes('publicdse_providersearch')) {
         try { providerApiBody = await res.text(); } catch {}
       }
     });
+
+    const targetLower = specialty.toLowerCase().trim();
+    const normalizedTarget = normalizeSpecialty(specialty);
 
     // ── Step 1: Landing page → enter ZIP ──────────────────────────────────────
     await page.goto(
@@ -69,7 +108,7 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
     }
     await page.waitForTimeout(800);
 
-    // ── Step 3: Click Continue (not hidden by ng-hide) ────────────────────────
+    // ── Step 3: Click Continue ────────────────────────────────────────────────
     const contBtn = page.locator('button:not(.ng-hide):has-text("Continue")').first();
     if (await contBtn.count() > 0) {
       await contBtn.click();
@@ -111,29 +150,44 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
     await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
     await page.waitForTimeout(800);
 
-    // ── Step 6: Click specialty (or "All Medical Specialists") ────────────────
+    // ── Step 6: Click specialty ───────────────────────────────────────────────
     const responsePromise = page.waitForResponse(
       res => res.url().includes('publicdse_providersearch'),
       { timeout: 25000 }
     ).catch(() => null);
 
-    // Try exact specialty match first, fall back to "All Medical Specialists"
-    const specialtyClicked = await page.evaluate((targetSpecialty) => {
-      const all = Array.from(document.querySelectorAll('a, button, li, span, div[role="button"]'));
-      // Try exact match for requested specialty
-      const exact = all.find(el => el.offsetParent !== null &&
-        el.textContent?.trim().toLowerCase() === targetSpecialty.toLowerCase());
+    const specialtyClicked = await page.evaluate(([tLower, nTarget]) => {
+      const all = Array.from(document.querySelectorAll('a, button, li, span, div[role="button"]'))
+        .filter(el => el.offsetParent !== null && el.textContent?.trim());
+
+      // 1. Exact match on normalized target (e.g. "cardiology")
+      const exact = all.find(el => el.textContent.trim().toLowerCase() === nTarget);
       if (exact) { exact.click(); return 'exact: ' + exact.textContent.trim(); }
-      // Try partial match
-      const partial = all.find(el => el.offsetParent !== null &&
-        el.textContent?.toLowerCase().includes(targetSpecialty.toLowerCase()));
-      if (partial) { partial.click(); return 'partial: ' + partial.textContent.trim().substring(0, 50); }
-      // Fallback: All Medical Specialists
-      const allSpec = all.find(el => el.offsetParent !== null &&
-        el.textContent?.includes('All Medical Specialists'));
+
+      // 2. Element text starts with or equals the target
+      const startsWith = all.find(el => el.textContent.trim().toLowerCase().startsWith(nTarget));
+      if (startsWith) { startsWith.click(); return 'startsWith: ' + startsWith.textContent.trim(); }
+
+      // 3. Normalized target is contained in element text
+      const inEl = all.find(el => el.textContent.trim().toLowerCase().includes(nTarget));
+      if (inEl) { inEl.click(); return 'inEl: ' + inEl.textContent.trim(); }
+
+      // 4. Element text is contained in normalized target (e.g. el="cardio", target="cardiology")
+      const elInTarget = all.find(el => nTarget.includes(el.textContent.trim().toLowerCase()) && el.textContent.trim().length > 3);
+      if (elInTarget) { elInTarget.click(); return 'elInTarget: ' + elInTarget.textContent.trim(); }
+
+      // 5. Original (non-normalized) term search
+      const original = all.find(el => el.textContent.trim().toLowerCase().includes(tLower));
+      if (original) { original.click(); return 'original: ' + original.textContent.trim(); }
+
+      // 6. Fallback: All Medical Specialists
+      const allSpec = all.find(el => el.textContent?.includes('All Medical Specialists'));
       if (allSpec) { allSpec.click(); return 'fallback: All Medical Specialists'; }
+
       return 'not found';
-    }, specialty);
+    }, [targetLower, normalizedTarget]);
+
+    console.log(`[Aetna] Specialty click result: ${specialtyClicked}`);
 
     await responsePromise;
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
@@ -147,13 +201,12 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
     const data = JSON.parse(providerApiBody);
     const providers = data?.providersResponse?.readProvidersResponse?.providerInfoResponses || [];
 
-    return providers.slice(0, maxResults).map(p => {
+    const results = providers.slice(0, maxResults).map(p => {
       const info = p.providerInformation || {};
       const loc = p.providerLocations || {};
       const addr = loc.address || {};
       const contacts = loc.contacts || {};
 
-      // specialty can be a single object or array
       let specialtyDesc = '';
       const spec = p.providerSpecialties;
       if (Array.isArray(spec)) {
@@ -161,7 +214,6 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
       } else if (spec?.specialty) {
         specialtyDesc = spec.specialty.description || '';
       }
-      // decode HTML entities
       specialtyDesc = specialtyDesc.replace(/&#38;/g, '&').replace(/&amp;/g, '&');
 
       const designations = Array.isArray(p.providerDesignations)
@@ -173,7 +225,7 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
         network: 'Aetna Open Choice PPO',
         name: info.providerDisplayName?.full || '',
         npi: info.primaryNPI?.nationalProviderId || '',
-        providerType: info.type || '', // "Individual" | "Organization"
+        providerType: info.type || '',
         specialty: specialtyDesc,
         address: {
           street: addr.streetLine1 || '',
@@ -189,11 +241,23 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
         longitude: parseFloat(addr.longitude) || null,
         acceptingNewPatients: loc.acceptsNewPatients === 'Y',
         virtualVisits: telemedicine,
-        inNetwork: true, // by definition — we searched within plan network
+        inNetwork: true,
         providerId: info.providerID || '',
         locationId: loc.locationID || '',
       };
     });
+
+    // Post-filter: if we didn't fall back, filter results to match specialty
+    if (!specialtyClicked.includes('fallback')) {
+      const filtered = results.filter(r =>
+        r.specialty.toLowerCase().includes(normalizedTarget) ||
+        normalizedTarget.includes(r.specialty.toLowerCase())
+      );
+      // Only apply filter if it returns something meaningful
+      if (filtered.length > 0) return filtered;
+    }
+
+    return results;
   } finally {
     await browser.close();
   }
