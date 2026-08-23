@@ -140,8 +140,7 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
       } catch {}
     });
 
-    // Step 1: Navigate via Choice Plus deeplink (works for BOTH specialty and name)
-    // Flow: deeplink → ZIP entry page → unified search (ALL: doctors/hospitals/names)
+    // Step 1: Navigate via Choice Plus deeplink → lands on ZIP/location page
     await page.goto(
       `https://findcare.guest.uhc.com/guest-plan-selection/browse?deeplink=${CHOICE_PLUS_DEEPLINK}`,
       { waitUntil: 'domcontentloaded', timeout: 40000 }
@@ -149,37 +148,32 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
     await page.waitForTimeout(2500);
     console.log(`[UHC] After deeplink nav: ${page.url()}`);
 
-    // Step 2: Enter ZIP on the location/ZIP page and submit
-    // Try Playwright click+type first (most reliable), fall back to evaluate
-    const zipSel = 'input[placeholder*="ZIP" i], input[placeholder*="zip" i], input[aria-label*="zip" i], input[id*="zip" i], input[name*="zip" i]';
-    const zipLocator = page.locator(zipSel).first();
-    if (await zipLocator.count() > 0) {
-      await zipLocator.click({ timeout: 5000 }).catch(() => {});
-      await zipLocator.fill(zip, { timeout: 5000 }).catch(() => {});
-      console.log(`[UHC] ZIP entered via locator`);
-    } else {
-      // Fallback: first visible text input
-      await page.evaluate((z) => {
-        const el = Array.from(document.querySelectorAll('input'))
-          .find(i => i.offsetParent !== null && i.type !== 'hidden' && i.type !== 'checkbox' && i.type !== 'radio');
-        if (!el) return;
-        el.value = z;
-        el.dispatchEvent(new Event('input',  { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      }, zip);
-      console.log(`[UHC] ZIP entered via evaluate fallback`);
-    }
-    await page.waitForTimeout(600);
-
-    // Click the Search/Continue button on the ZIP page
-    await page.evaluate(() => {
-      const btn = Array.from(document.querySelectorAll('button, input[type="submit"]')).find(b =>
-        b.offsetParent !== null && /search|continue|submit|find|go/i.test(b.textContent || b.value || '')
-      );
-      if (btn) btn.click();
+    // Step 2: Type ZIP → a location dropdown appears → click the first suggestion
+    // (This is an autocomplete, NOT a form submit button)
+    const zipInput = page.locator('input').first();
+    await zipInput.click({ timeout: 8000 }).catch(() => {});
+    await zipInput.fill(zip).catch(async () => {
+      // fallback: type character by character
+      await page.keyboard.type(zip, { delay: 80 });
     });
+    await page.waitForTimeout(1200);
+
+    // Wait for location dropdown options and click the first one
+    await page.waitForSelector('[role="option"], [role="listbox"] li, ul[class*="suggest"] li', {
+      timeout: 10000,
+    }).catch(() => {});
+
+    const locationOption = page.locator('[role="option"]').first();
+    if (await locationOption.count() > 0) {
+      await locationOption.click();
+      console.log(`[UHC] Clicked location dropdown option for ZIP ${zip}`);
+    } else {
+      // Fallback: press Enter
+      await page.keyboard.press('Enter');
+      console.log(`[UHC] No location dropdown — pressed Enter`);
+    }
     await page.waitForTimeout(3000);
-    console.log(`[UHC] After ZIP submit: ${page.url()}`);
+    console.log(`[UHC] After ZIP selection: ${page.url()}`);
 
     // Step 3: Dismiss any modal
     await page.evaluate(() => {
