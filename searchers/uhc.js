@@ -367,14 +367,24 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
 
     console.log(`[UHC] Total providers captured: ${all.length}`);
 
-    // Sort: medical specialists first, dental/chiro last
-    all.sort((a, b) => {
+    // For name searches: filter out dental (separate UHC product, not Choice Plus medical)
+    // For specialty searches: keep all, just sort medical first
+    let filtered = all;
+    if (isNameSearch) {
+      const nonDental = all.filter(p => {
+        const spec = (p.speciality || p.specialities?.[0]?.value || '').toLowerCase();
+        return !/dental|dentist|orthodont|periodont|endodont|prosthodont|oral surgery/i.test(spec);
+      });
+      filtered = nonDental.length > 0 ? nonDental : all; // fallback to all if nothing else
+    }
+
+    filtered.sort((a, b) => {
       const sa = a.speciality || a.specialities?.[0]?.value || '';
       const sb = b.speciality || b.specialities?.[0]?.value || '';
       return specialtyPriority(sb) - specialtyPriority(sa);
     });
 
-    return all.slice(0, maxResults).map(p => ({
+    return filtered.slice(0, maxResults).map(p => ({
       network: 'UHC Choice Plus',
       name: p.providerName,
       npi: p.npi,
@@ -522,12 +532,17 @@ async function suggestUHC({ name, zip = '77041' } = {}) {
     await page.waitForTimeout(200);
     await page.keyboard.type(name, { delay: 80 });
 
-    // Wait up to 6s for AutoComplete response
-    await page.waitForTimeout(6000);
+    // Wait up to 6s for AutoComplete response (page may have closed if request was cancelled)
+    await page.waitForTimeout(6000).catch(() => {});
 
-    suggestions.sort((a, b) => specialtyPriority(b.specialty) - specialtyPriority(a.specialty));
-    console.log(`[UHC suggest] Returning ${suggestions.length} suggestions for "${name}"`);
-    return suggestions;
+    // Filter out dental from suggestions (separate product, not medical Choice Plus)
+    const nonDental = suggestions.filter(s =>
+      !/dental|dentist|orthodont|periodont|endodont|prosthodont|oral surgery/i.test(s.specialty || '')
+    );
+    const finalSuggestions = nonDental.length > 0 ? nonDental : suggestions;
+    finalSuggestions.sort((a, b) => specialtyPriority(b.specialty) - specialtyPriority(a.specialty));
+    console.log(`[UHC suggest] Returning ${finalSuggestions.length} suggestions for "${name}" (${suggestions.length - finalSuggestions.length} dental filtered)`);
+    return finalSuggestions;
   } finally {
     await browser.close();
   }

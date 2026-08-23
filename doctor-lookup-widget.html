@@ -208,10 +208,10 @@ document.addEventListener('click', function(e) {
 });
 
 // ── DOCTOR NAME AUTOCOMPLETE ──────────────────────────────────────────────
-var pvDrNameInp = document.getElementById('pvDrName');
-var pvDrDrp     = document.getElementById('pvDrDrp');
-var pvDrTimer   = null;
-var pvDrLoading = false;
+var pvDrNameInp   = document.getElementById('pvDrName');
+var pvDrDrp       = document.getElementById('pvDrDrp');
+var pvDrTimer     = null;
+var pvDrCtrl      = null; // AbortController for in-flight suggest requests
 
 function pvShowDrDrop(items) {
   if (!items || !items.length) { pvDrDrp.style.display = 'none'; return; }
@@ -246,11 +246,14 @@ pvDrNameInp.addEventListener('input', function() {
   pvDrDrp.style.display = 'block';
   pvDrTimer = setTimeout(function() {
     var zip = document.getElementById('pvDrZip').value.trim() || '77041';
-    fetch(PV_API + '/api/suggest?name=' + encodeURIComponent(q) + '&zip=' + encodeURIComponent(zip))
+    if (pvDrCtrl) pvDrCtrl.abort();
+    pvDrCtrl = new AbortController();
+    fetch(PV_API + '/api/suggest?name=' + encodeURIComponent(q) + '&zip=' + encodeURIComponent(zip),
+      { signal: pvDrCtrl.signal })
       .then(function(r) { return r.json(); })
       .then(function(d) { pvShowDrDrop(d.suggestions || []); })
-      .catch(function() { pvDrDrp.style.display = 'none'; });
-  }, 400);
+      .catch(function(e) { if (e.name !== 'AbortError') pvDrDrp.style.display = 'none'; });
+  }, 500);
 });
 
 document.addEventListener('click', function(e) {
