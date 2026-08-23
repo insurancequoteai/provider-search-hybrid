@@ -155,19 +155,27 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
     await page.waitForTimeout(4000);
     console.log(`[UHC] find-care loaded: ${page.url()}`);
 
-    // Step 3: Dismiss any modal
+    // Step 3: Dismiss any modal / overlay that would intercept pointer events
     await page.evaluate(() => {
-      const selectors = [
+      // Click close buttons on any visible modal
+      const closeSelectors = [
         'button[aria-label="close"]', 'button[aria-label="Close"]',
         '[data-testid="modal-close"]', '[aria-label="Close dialog"]',
-        '.abyss-icon-button',
+        '.abyss-icon-button', 'button[class*="close" i]', '[class*="modal"] button',
       ];
-      for (const sel of selectors) {
+      for (const sel of closeSelectors) {
         const el = document.querySelector(sel);
-        if (el && el.offsetParent !== null) { el.click(); return; }
+        if (el && el.offsetParent !== null) { el.click(); break; }
       }
+      // Also remove any fixed overlays that block pointer events
+      document.querySelectorAll('[class*="overlay" i], [class*="backdrop" i], [class*="modal" i]').forEach(el => {
+        const style = window.getComputedStyle(el);
+        if (style.position === 'fixed' || style.position === 'absolute') {
+          el.style.pointerEvents = 'none';
+        }
+      });
     });
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(1000);
 
     // Step 4: Find the main search input (unified search: doctors/hospitals/names)
     await page.waitForSelector('input[role="combobox"], input[type="search"], input[type="text"]', { timeout: 20000 }).catch(() => {});
@@ -203,7 +211,7 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
       throw new Error('UHC: could not find search input');
     }
 
-    // Step 4: Type search term (name or specialty)
+    // Step 4: Type search term — use evaluate to bypass any overlay/interceptor
     const searchDone = new Promise(resolve => {
       setTimeout(resolve, 30000);
       const check = setInterval(() => {
@@ -211,9 +219,21 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
       }, 200);
     });
 
-    await searchInput.click();
-    await searchInput.fill(''); // clear any existing content
-    await searchInput.type(searchTerm, { delay: 80 });
+    // Focus and clear via JS (bypasses pointer-event interception from overlays)
+    await page.evaluate(() => {
+      const el = document.querySelector(
+        'input[role="combobox"], input[type="search"], input[placeholder*="doctor" i], input[placeholder*="name" i], input[placeholder*="search" i], input[placeholder*="specialty" i]'
+      );
+      if (el) {
+        el.focus();
+        el.value = '';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    });
+    await page.waitForTimeout(300);
+
+    // Type the search term character by character via keyboard (field already focused)
+    await page.keyboard.type(searchTerm, { delay: 80 });
     await page.waitForTimeout(1500);
 
     // Step 5: Handle autocomplete dropdown
