@@ -34,6 +34,25 @@ function zipToLatLon(zip) {
 }
 
 /**
+ * Returns a sort priority for a specialty string.
+ * Higher = shown first. Dental/Vision/Chiropractic sink to the bottom.
+ */
+function specialtyPriority(spec) {
+  if (!spec) return 1;
+  const s = spec.toLowerCase();
+  // Deprioritize non-medical specialties
+  if (/dental|dentist|orthodont|periodont|endodont|prosthodont|oral surgery/i.test(s)) return 0;
+  if (/chiropractic|optom|ophthalmol|vision|audiol/i.test(s)) return 1;
+  // Prioritize primary care and medical specialists
+  if (/hospital|medical center|health system|health network|urgent care|emergency/i.test(s)) return 4;
+  if (/family|internal medicine|primary care|general practice|pediatric|geriatric/i.test(s)) return 4;
+  if (/cardiol|oncol|neurolog|orthopedic|gastro|pulmonol|endocrinol|nephrol|rheumatol|urolog|dermatol|psychiatr|psycholog/i.test(s)) return 3;
+  // Other medical
+  if (/medical|physician|nurse|pa |assistant|surgery|surgeon/i.test(s)) return 2;
+  return 1;
+}
+
+/**
  * Normalize a UHC AutoComplete provData entry to the standard provider shape.
  * AutoComplete fields: displayName, displayAddress (string), locationId, providerId,
  * providerType, speciality (array of {description, providerType, category}).
@@ -157,15 +176,33 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
           return;
         }
 
-        // AutoComplete response — for name search, extract provider suggestions
+        // AutoComplete response — for name search, extract provider/facility suggestions
         // Structure: body.data.autoComplete.practitioners_uhc.provData[]
+        //            body.data.autoComplete.facilities_uhc.provData[]
         if (isNameSearch && url.includes('q=AutoComplete')) {
-          const provData = body?.data?.autoComplete?.practitioners_uhc?.provData;
+          const ac = body?.data?.autoComplete;
+          const combined = [];
+
+          // Practitioners
+          const provData = ac?.practitioners_uhc?.provData;
           if (Array.isArray(provData) && provData.length > 0) {
-            console.log(`[UHC] AutoComplete provData found: ${provData.length} providers`);
-            const normalized = provData.map(p => normalizeAutoCompleteProvider(p));
-            providerBatches.push(normalized);
+            console.log(`[UHC] AutoComplete practitioners: ${provData.length}`);
+            combined.push(...provData.map(p => normalizeAutoCompleteProvider(p)));
           }
+
+          // Facilities / hospitals — check all keys ending in _uhc for provData
+          if (ac && typeof ac === 'object') {
+            for (const key of Object.keys(ac)) {
+              if (key === 'practitioners_uhc' || key === 'lang_provider') continue;
+              const facData = ac[key]?.provData;
+              if (Array.isArray(facData) && facData.length > 0) {
+                console.log(`[UHC] AutoComplete ${key}: ${facData.length}`);
+                combined.push(...facData.map(p => normalizeAutoCompleteProvider(p)));
+              }
+            }
+          }
+
+          if (combined.length > 0) providerBatches.push(combined);
           return;
         }
 
@@ -330,6 +367,13 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
 
     console.log(`[UHC] Total providers captured: ${all.length}`);
 
+    // Sort: medical specialists first, dental/chiro last
+    all.sort((a, b) => {
+      const sa = a.speciality || a.specialities?.[0]?.value || '';
+      const sb = b.speciality || b.specialities?.[0]?.value || '';
+      return specialtyPriority(sb) - specialtyPriority(sa);
+    });
+
     return all.slice(0, maxResults).map(p => ({
       network: 'UHC Choice Plus',
       name: p.providerName,
@@ -420,10 +464,23 @@ async function suggestUHC({ name, zip = '77041' } = {}) {
       if (!res.url().includes('q=AutoComplete')) return;
       try {
         const body = await res.json();
-        const provData = body?.data?.autoComplete?.practitioners_uhc?.provData;
-        if (Array.isArray(provData) && provData.length > 0) {
-          console.log(`[UHC suggest] provData found: ${provData.length} for "${name}"`);
-          suggestions = provData.map(p => {
+        const ac = body?.data?.autoComplete;
+        const combined = [];
+
+        const provData = ac?.practitioners_uhc?.provData;
+        if (Array.isArray(provData)) combined.push(...provData);
+
+        if (ac && typeof ac === 'object') {
+          for (const key of Object.keys(ac)) {
+            if (key === 'practitioners_uhc' || key === 'lang_provider') continue;
+            const facData = ac[key]?.provData;
+            if (Array.isArray(facData) && facData.length > 0) combined.push(...facData);
+          }
+        }
+
+        if (combined.length > 0) {
+          console.log(`[UHC suggest] total entries found: ${combined.length} for "${name}"`);
+          suggestions = combined.map(p => {
             const norm = normalizeAutoCompleteProvider(p);
             return {
               providerName: norm.providerName,
@@ -468,6 +525,7 @@ async function suggestUHC({ name, zip = '77041' } = {}) {
     // Wait up to 6s for AutoComplete response
     await page.waitForTimeout(6000);
 
+    suggestions.sort((a, b) => specialtyPriority(b.specialty) - specialtyPriority(a.specialty));
     console.log(`[UHC suggest] Returning ${suggestions.length} suggestions for "${name}"`);
     return suggestions;
   } finally {
