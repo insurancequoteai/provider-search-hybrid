@@ -129,6 +129,7 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
     page.setDefaultTimeout(60000);
 
     const providerBatches = [];
+    let paginatedResolved = false; // set true when GetCareTeamPaginated is captured
 
     // Intercept GraphQL requests and patch lat/lon/state to match requested ZIP
     await page.route('**graphql**', async route => {
@@ -203,6 +204,38 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
           }
 
           if (combined.length > 0) providerBatches.push(combined);
+          return;
+        }
+
+        // GetCareTeamPaginated — fires after name free-text Enter; contains full provider list
+        if (isNameSearch && url.includes('q=GetCareTeamPaginated')) {
+          const data = body?.data;
+          if (data) {
+            // Try known paths
+            const section = data.getCareTeamPaginated || data.careTeam || data.providerSearch;
+            if (section) {
+              const providers = section.providers || section.providerList;
+              if (Array.isArray(providers) && providers.length > 0) {
+                console.log(`[UHC] GetCareTeamPaginated: ${providers.length} providers`);
+                providerBatches.push(providers);
+                paginatedResolved = true;
+                return;
+              }
+            }
+            // Fallback: scan all keys for a providers array
+            for (const key of Object.keys(data)) {
+              const val = data[key];
+              const arr = val?.providers || val?.providerList;
+              if (Array.isArray(arr) && arr.length > 0) {
+                console.log(`[UHC] GetCareTeamPaginated via "${key}": ${arr.length} providers`);
+                providerBatches.push(arr);
+                paginatedResolved = true;
+                return;
+              }
+            }
+            console.log(`[UHC] GetCareTeamPaginated: unmatched structure. Keys: ${Object.keys(data).join(', ')}`);
+          }
+          paginatedResolved = true; // mark done even if empty so we don't hang
           return;
         }
 
@@ -321,6 +354,12 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
         await page.waitForTimeout(200);
         await page.keyboard.press('Enter'); // submit name as free-text search
         console.log(`[UHC] Name search: dismissed autocomplete, submitted via Enter`);
+        // Wait up to 12s for GetCareTeamPaginated to fire and be captured
+        await new Promise(resolve => {
+          const t = setTimeout(resolve, 12000);
+          const iv = setInterval(() => { if (paginatedResolved) { clearInterval(iv); clearTimeout(t); resolve(); } }, 200);
+        });
+        console.log(`[UHC] GetCareTeamPaginated wait done. paginatedResolved=${paginatedResolved}`);
       } else {
         // Specialty: arrow to first option and select
         const firstText = (await options[0].textContent().catch(() => '')) || '';
