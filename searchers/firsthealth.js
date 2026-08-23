@@ -45,21 +45,21 @@ module.exports = async function firsthealthSearch({ zip, name, specialty, npi } 
     );
     await page.waitForTimeout(2000);
 
-    // Select First Health radio and click submit
-    await page.evaluate(() => {
-      const radios = Array.from(document.querySelectorAll('input[type="radio"][name="RadioButtonSelected"]'));
-      const fh = radios.find(r => {
-        const label = document.querySelector(`label[for="${r.id}"]`);
-        return label && label.textContent.includes('First Health') && !label.textContent.includes('Choice');
-      }) || radios[0];
-      if (fh) fh.click();
-    });
-    await page.waitForTimeout(500);
-
-    // Use locator click for submit — more reliable than evaluate click for navigation
+    // Select First Health radio and click submit — all via evaluate to bypass visibility checks
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
-      page.locator('#btnSubmit').click(),
+      page.evaluate(() => {
+        const radios = Array.from(document.querySelectorAll('input[type="radio"][name="RadioButtonSelected"]'));
+        const fh = radios.find(r => {
+          const label = document.querySelector(`label[for="${r.id}"]`);
+          return label && label.textContent.includes('First Health') && !label.textContent.includes('Choice');
+        }) || radios[0];
+        if (fh) fh.click();
+        const btn = document.querySelector('#btnSubmit') ||
+          Array.from(document.querySelectorAll('button, input[type="submit"]'))
+            .find(b => /submit|search|next|continue/i.test(b.value || b.textContent));
+        if (btn) btn.click();
+      }),
     ]);
 
     const onTypeSelection = await waitForUrlContains(page, 'ProviderTypeSelection', 15000);
@@ -85,7 +85,12 @@ module.exports = async function firsthealthSearch({ zip, name, specialty, npi } 
 
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
-      page.locator('#btnSubmit').click(),
+      page.evaluate(() => {
+        const btn = document.querySelector('#btnSubmit') ||
+          Array.from(document.querySelectorAll('button, input[type="submit"]'))
+            .find(b => /submit|search|next|continue/i.test(b.value || b.textContent));
+        if (btn) btn.click();
+      }),
     ]);
 
     await waitForUrlContains(page, 'SearchIndex', 15000);
