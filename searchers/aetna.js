@@ -1,55 +1,24 @@
 // searchers/aetna.js
 // Aetna Open Choice PPO provider search via Playwright + stealth
+// Full navigation: landing → zip → plan → Medical Doctors → Medical Specialists → results
 
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
 
-const SPECIALTY_ALIASES = {
-  'cardiologist':       'cardiology',
-  'dermatologist':      'dermatology',
-  'neurologist':        'neurology',
-  'oncologist':         'oncology',
-  'ophthalmologist':    'ophthalmology',
-  'orthopedic':         'orthopedic',
-  'orthopedist':        'orthopedic',
-  'psychiatrist':       'psychiatry',
-  'psychologist':       'psychology',
-  'urologist':          'urology',
-  'endocrinologist':    'endocrinology',
-  'gastroenterologist': 'gastroenterology',
-  'hematologist':       'hematology',
-  'nephrologist':       'nephrology',
-  'pulmonologist':      'pulmonology',
-  'rheumatologist':     'rheumatology',
-  'allergist':          'allergy',
-  'immunologist':       'immunology',
-  'obstetrician':       'obstetrics',
-  'gynecologist':       'gynecology',
-  'pediatrician':       'pediatrics',
-  'radiologist':        'radiology',
-  'anesthesiologist':   'anesthesiology',
-};
-
-function normalizeSpecialty(raw) {
-  const lower = raw.toLowerCase().trim();
-  return SPECIALTY_ALIASES[lower] || lower;
-}
-
-// Wait for URL fragment change (Aetna uses hash routing)
-async function waitForHash(page, fragment, timeout = 20000) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    if (page.url().includes(fragment)) return true;
-    await page.waitForTimeout(300);
-  }
-  return false;
-}
-
-async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041', maxResults = 25 } = {}) {
+/**
+ * @param {object} opts
+ * @param {string} [opts.specialty]  - e.g. "Cardiologist", "All Medical Specialists"
+ * @param {string} [opts.name]       - provider name for name search
+ * @param {string} opts.zip          - 5-digit ZIP code
+ * @param {number} [opts.maxResults=25]
+ * @returns {Promise<Array>} normalized provider objects
+ */
+async function searchAetna({ specialty = 'All Medical Specialists', name = '', zip = '77041', maxResults = 25 } = {}) {
+  const isNameSearch = !!name;
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
   });
 
   try {
@@ -61,22 +30,20 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
     });
 
     let providerApiBody = null;
+
     page.on('response', async res => {
       if (res.url().includes('publicdse_providersearch')) {
         try { providerApiBody = await res.text(); } catch {}
       }
     });
 
-    const targetLower = specialty.toLowerCase().trim();
-    const normalizedTarget = normalizeSpecialty(specialty);
-
     // ── Step 1: Landing page → enter ZIP ──────────────────────────────────────
     await page.goto(
       'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearchLanding&site_id=dse&language=en',
-      { waitUntil: 'domcontentloaded', timeout: 40000 }
+      { waitUntil: 'networkidle', timeout: 30000 }
     );
-    await page.waitForTimeout(3000);
-    await page.waitForSelector('#zip1', { timeout: 15000 });
+    await page.waitForTimeout(2000);
+    await page.waitForSelector('#zip1', { timeout: 10000 });
     await page.click('#zip1', { clickCount: 3 });
     await page.type('#zip1', zip, { delay: 100 });
     await page.evaluate(() => {
@@ -85,26 +52,26 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
       el?.dispatchEvent(new Event('change', { bubbles: true }));
       el?.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
     });
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(500);
     await page.keyboard.press('Enter');
-
-    const gotPlanList = await waitForHash(page, 'providerSearchPlanList', 25000);
-    if (!gotPlanList) {
+    await page.waitForURL('**/providerSearchPlanList**', { timeout: 20000 }).catch(() => {});
+    if (!page.url().includes('providerSearchPlanList')) {
       await page.locator('button:has-text("Search")').first().click().catch(() => {});
-      await waitForHash(page, 'providerSearchPlanList', 20000);
+      await page.waitForURL('**/providerSearchPlanList**', { timeout: 15000 }).catch(() => {});
     }
-    await page.waitForTimeout(2000);
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
 
     // ── Step 2: Select Open Choice PPO ────────────────────────────────────────
+    await page.waitForTimeout(800);
     const ppLabel = page.locator('label').filter({ hasText: 'Open Choice' }).first();
     if (await ppLabel.count() > 0) {
       await ppLabel.click();
     } else {
       await page.locator('input[type="radio"][value*="MPPO"]').first().click().catch(() => {});
     }
-    await page.waitForTimeout(1000);
+    await page.waitForTimeout(800);
 
-    // ── Step 3: Click Continue ────────────────────────────────────────────────
+    // ── Step 3: Click Continue (not hidden by ng-hide) ────────────────────────
     const contBtn = page.locator('button:not(.ng-hide):has-text("Continue")').first();
     if (await contBtn.count() > 0) {
       await contBtn.click();
@@ -116,77 +83,148 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
         if (btn) btn.click();
       });
     }
-    await waitForHash(page, 'providerSearch', 20000);
-    await page.waitForTimeout(2000);
+    await page.waitForURL('**/providerSearch**', { timeout: 15000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
 
-    // ── Step 4: Medical Doctors ───────────────────────────────────────────────
-    await page.evaluate(() => {
-      Array.from(document.querySelectorAll('a, button, li, span'))
-        .find(el => el.offsetParent !== null && el.textContent?.includes('Medical Doctors'))?.click();
-    });
-    await waitForHash(page, 'providerMedical', 20000);
-    await page.waitForTimeout(2000);
+    if (isNameSearch) {
+      // ── Name search: find the "Search by Provider Name" option ───────────────
+      // After plan selection Aetna shows category tiles; there's a name/keyword input
+      // on the main providerSearch page or a dedicated "By Provider Name" tile
+      await page.waitForTimeout(800);
 
-    // ── Step 5: Medical Specialists ───────────────────────────────────────────
-    await page.evaluate(() => {
-      Array.from(document.querySelectorAll('a, button, li, span'))
-        .find(el => el.offsetParent !== null &&
-          el.textContent?.includes('Medical Specialists') &&
-          !el.textContent?.includes('All'))?.click();
-    });
-    await waitForHash(page, 'providerSearchSpecialists', 20000);
-    await page.waitForTimeout(2000);
+      const responsePromise = page.waitForResponse(
+        res => res.url().includes('publicdse_providersearch'),
+        { timeout: 30000 }
+      ).catch(() => null);
 
-    // ── Step 6: Click specialty ───────────────────────────────────────────────
-    const responsePromise = page.waitForResponse(
-      res => res.url().includes('publicdse_providersearch'),
-      { timeout: 30000 }
-    ).catch(() => null);
+      // Try clicking "Search by Name" / "Provider Name" tile if visible
+      const nameTileClicked = await page.evaluate(() => {
+        const els = Array.from(document.querySelectorAll('a, button, li, span, div[role="button"], div[ng-click]'));
+        const tile = els.find(el => el.offsetParent !== null && (
+          /provider name|search by name|find a doctor by name/i.test(el.textContent || '')
+        ));
+        if (tile) { tile.click(); return 'name-tile'; }
+        return null;
+      });
+      console.log(`[Aetna] Name tile: ${nameTileClicked}`);
 
-    const specialtyClicked = await page.evaluate(([tLower, nTarget]) => {
-      const all = Array.from(document.querySelectorAll('a, button, li, span, div[role="button"]'))
-        .filter(el => el.offsetParent !== null && el.textContent?.trim());
+      if (!nameTileClicked) {
+        // Fallback: click Medical Doctors then look for a name input there
+        await page.evaluate(() => {
+          Array.from(document.querySelectorAll('a, button, li, span'))
+            .find(el => el.offsetParent !== null && el.textContent?.includes('Medical Doctors'))?.click();
+        });
+        await page.waitForURL('**/providerMedical**', { timeout: 12000 }).catch(() => {});
+        await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+        await page.waitForTimeout(600);
+      }
 
-      const exact = all.find(el => el.textContent.trim().toLowerCase() === nTarget);
-      if (exact) { exact.click(); return 'exact: ' + exact.textContent.trim(); }
+      // Find the provider name input and type the name
+      await page.waitForTimeout(600);
+      const nameInputFound = await page.evaluate((providerName) => {
+        const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'));
+        const inp = inputs.find(el => el.offsetParent !== null && (
+          /name|provider|doctor|keyword|search/i.test(el.placeholder || '') ||
+          /name|provider|doctor|keyword/i.test(el.getAttribute('ng-model') || '') ||
+          /name|provider|doctor/i.test(el.getAttribute('aria-label') || '')
+        ));
+        if (inp) {
+          inp.value = providerName;
+          inp.dispatchEvent(new Event('input', { bubbles: true }));
+          inp.dispatchEvent(new Event('change', { bubbles: true }));
+          inp.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+          return inp.placeholder || inp.getAttribute('ng-model') || 'found';
+        }
+        return null;
+      }, name);
+      console.log(`[Aetna] Name input: ${nameInputFound}`);
 
-      const startsWith = all.find(el => el.textContent.trim().toLowerCase().startsWith(nTarget));
-      if (startsWith) { startsWith.click(); return 'startsWith: ' + startsWith.textContent.trim(); }
+      if (!nameInputFound) throw new Error('Aetna: could not find provider name input');
 
-      const inEl = all.find(el => el.textContent.trim().toLowerCase().includes(nTarget));
-      if (inEl) { inEl.click(); return 'inEl: ' + inEl.textContent.trim(); }
+      await page.waitForTimeout(400);
+      // Click Search button or press Enter
+      const searchClicked = await page.evaluate(() => {
+        const btn = Array.from(document.querySelectorAll('button, input[type="submit"]'))
+          .find(el => el.offsetParent !== null && /search|find|go/i.test(el.textContent || el.value || ''));
+        if (btn) { btn.click(); return btn.textContent?.trim() || 'submit'; }
+        return null;
+      });
+      if (!searchClicked) await page.keyboard.press('Enter');
+      console.log(`[Aetna] Name search submitted: ${searchClicked || 'Enter'}`);
 
-      const elInTarget = all.find(el =>
-        nTarget.includes(el.textContent.trim().toLowerCase()) && el.textContent.trim().length > 3);
-      if (elInTarget) { elInTarget.click(); return 'elInTarget: ' + elInTarget.textContent.trim(); }
+      await responsePromise;
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      await page.waitForTimeout(800);
 
-      const original = all.find(el => el.textContent.trim().toLowerCase().includes(tLower));
-      if (original) { original.click(); return 'original: ' + original.textContent.trim(); }
+    } else {
+      // ── Specialty search (existing flow) ─────────────────────────────────────
+      // Step 4: Medical Doctors
+      const medLink = page.locator('a, button, li').filter({ hasText: 'Medical Doctors' }).first();
+      if (await medLink.count() > 0) {
+        await medLink.click();
+      } else {
+        await page.evaluate(() => {
+          Array.from(document.querySelectorAll('a, button, li, span'))
+            .find(el => el.offsetParent !== null && el.textContent?.includes('Medical Doctors'))?.click();
+        });
+      }
+      await page.waitForURL('**/providerMedical**', { timeout: 15000 }).catch(() => {});
+      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
 
-      const allSpec = all.find(el => el.textContent?.includes('All Medical Specialists'));
-      if (allSpec) { allSpec.click(); return 'fallback: All Medical Specialists'; }
+      // Step 5: Medical Specialists
+      const specLink = page.locator('a, button, li').filter({ hasText: 'Medical Specialists' }).first();
+      if (await specLink.count() > 0) {
+        await specLink.click();
+      } else {
+        await page.evaluate(() => {
+          Array.from(document.querySelectorAll('a, button, li, span'))
+            .find(el => el.offsetParent !== null && el.textContent?.includes('Medical Specialists') && !el.textContent?.includes('All'))?.click();
+        });
+      }
+      await page.waitForURL('**/providerSearchSpecialists**', { timeout: 15000 }).catch(() => {});
+      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      await page.waitForTimeout(800);
 
-      return 'not found';
-    }, [targetLower, normalizedTarget]);
+      // Step 6: Click specialty (or "All Medical Specialists")
+      const responsePromise = page.waitForResponse(
+        res => res.url().includes('publicdse_providersearch'),
+        { timeout: 25000 }
+      ).catch(() => null);
 
-    console.log(`[Aetna] Specialty click: ${specialtyClicked}`);
+      const specialtyClicked = await page.evaluate((targetSpecialty) => {
+        const all = Array.from(document.querySelectorAll('a, button, li, span, div[role="button"]'));
+        const exact = all.find(el => el.offsetParent !== null &&
+          el.textContent?.trim().toLowerCase() === targetSpecialty.toLowerCase());
+        if (exact) { exact.click(); return 'exact: ' + exact.textContent.trim(); }
+        const partial = all.find(el => el.offsetParent !== null &&
+          el.textContent?.toLowerCase().includes(targetSpecialty.toLowerCase()));
+        if (partial) { partial.click(); return 'partial: ' + partial.textContent.trim().substring(0, 50); }
+        const allSpec = all.find(el => el.offsetParent !== null &&
+          el.textContent?.includes('All Medical Specialists'));
+        if (allSpec) { allSpec.click(); return 'fallback: All Medical Specialists'; }
+        return 'not found';
+      }, specialty);
 
-    await responsePromise;
-    await page.waitForTimeout(2000);
+      await responsePromise;
+      await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+      await page.waitForTimeout(1000);
+    }
 
     if (!providerApiBody) {
       throw new Error('Aetna: no provider search API response captured');
     }
 
+    // ── Parse response ─────────────────────────────────────────────────────────
     const data = JSON.parse(providerApiBody);
     const providers = data?.providersResponse?.readProvidersResponse?.providerInfoResponses || [];
 
-    const results = providers.slice(0, maxResults).map(p => {
+    return providers.slice(0, maxResults).map(p => {
       const info = p.providerInformation || {};
       const loc = p.providerLocations || {};
       const addr = loc.address || {};
       const contacts = loc.contacts || {};
 
+      // specialty can be a single object or array
       let specialtyDesc = '';
       const spec = p.providerSpecialties;
       if (Array.isArray(spec)) {
@@ -194,6 +232,7 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
       } else if (spec?.specialty) {
         specialtyDesc = spec.specialty.description || '';
       }
+      // decode HTML entities
       specialtyDesc = specialtyDesc.replace(/&#38;/g, '&').replace(/&amp;/g, '&');
 
       const designations = Array.isArray(p.providerDesignations)
@@ -205,7 +244,7 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
         network: 'Aetna Open Choice PPO',
         name: info.providerDisplayName?.full || '',
         npi: info.primaryNPI?.nationalProviderId || '',
-        providerType: info.type || '',
+        providerType: info.type || '', // "Individual" | "Organization"
         specialty: specialtyDesc,
         address: {
           street: addr.streetLine1 || '',
@@ -221,21 +260,11 @@ async function searchAetna({ specialty = 'All Medical Specialists', zip = '77041
         longitude: parseFloat(addr.longitude) || null,
         acceptingNewPatients: loc.acceptsNewPatients === 'Y',
         virtualVisits: telemedicine,
-        inNetwork: true,
+        inNetwork: true, // by definition — we searched within plan network
         providerId: info.providerID || '',
         locationId: loc.locationID || '',
       };
     });
-
-    if (!specialtyClicked.includes('fallback')) {
-      const filtered = results.filter(r =>
-        r.specialty.toLowerCase().includes(normalizedTarget) ||
-        normalizedTarget.includes(r.specialty.toLowerCase())
-      );
-      if (filtered.length > 0) return filtered;
-    }
-
-    return results;
   } finally {
     await browser.close();
   }
