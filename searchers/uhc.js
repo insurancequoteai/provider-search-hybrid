@@ -1,5 +1,5 @@
 // searchers/uhc.js
-// UHC Choice Plus provider search via direct URL bypass + GraphQL ProviderSearch
+// UHC Choice Plus provider search via GraphQL request interception + ZIP patching
 
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
@@ -31,6 +31,44 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
 
     const providerBatches = [];
 
+    // Intercept outgoing GraphQL ProviderSearch requests and patch the ZIP
+    await page.route('**graphql**', async route => {
+      const request = route.request();
+      const url = request.url();
+
+      if (!url.includes('ProviderSearch')) {
+        return route.continue();
+      }
+
+      try {
+        const body = request.postDataJSON();
+        console.log('[UHC] GraphQL vars:', JSON.stringify(body?.variables));
+
+        // Recursively patch any zip/postal/location fields in variables
+        const patchZip = (obj) => {
+          if (!obj || typeof obj !== 'object') return;
+          for (const key of Object.keys(obj)) {
+            const lk = key.toLowerCase();
+            if (typeof obj[key] === 'string' && /zip|postal|zipcode/i.test(lk)) {
+              console.log(`[UHC] Patching ${key}: ${obj[key]} → ${zip}`);
+              obj[key] = zip;
+            } else if (typeof obj[key] === 'object') {
+              patchZip(obj[key]);
+            }
+          }
+        };
+
+        if (body?.variables) {
+          patchZip(body.variables);
+        }
+
+        await route.continue({ postData: JSON.stringify(body) });
+      } catch (e) {
+        console.log('[UHC] Route error:', e.message);
+        route.continue();
+      }
+    });
+
     // Collect all ProviderSearch GraphQL responses
     page.on('response', async res => {
       const url = res.url();
@@ -61,29 +99,6 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
 
     // Wait for React SPA to hydrate
     await page.waitForTimeout(4000);
-
-    // Step 2b: Force the ZIP — cloud server IP may default to wrong location
-    try {
-      const locInput = page.locator(
-        'input[placeholder*="City" i], input[placeholder*="Zip" i], input[placeholder*="Location" i], input[aria-label*="location" i], input[aria-label*="zip" i]'
-      ).first();
-      if (await locInput.count() > 0 && await locInput.isVisible()) {
-        const currentVal = await locInput.inputValue().catch(() => '');
-        if (!currentVal.includes(zip)) {
-          await locInput.click({ clickCount: 3 });
-          await locInput.fill('');
-          await locInput.type(zip, { delay: 80 });
-          await page.waitForTimeout(1500);
-          const locOpt = page.locator('[role="option"]').first();
-          if (await locOpt.count() > 0) {
-            await locOpt.click();
-          } else {
-            await page.keyboard.press('Enter');
-          }
-          await page.waitForTimeout(1500);
-        }
-      }
-    } catch {}
 
     // Step 3: Dismiss any modal
     await page.evaluate(() => {
