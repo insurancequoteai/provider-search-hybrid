@@ -1,0 +1,396 @@
+<!-- ══════════════════════════════════════════════════════
+     🩺  DOCTOR / PROVIDER NETWORK LOOKUP WIDGET
+     Paste this right after the closing </div> of the
+     prescription widget (before </body>).
+     Make sure node server.js is running on this machine,
+     OR change PV_API below to your deployed server URL.
+     ══════════════════════════════════════════════════════ -->
+
+<style>
+@keyframes pv-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+</style>
+
+<div class="wrap" style="margin-top:24px;padding-bottom:60px">
+  <div style="background:#fff;border:1px solid #e0e3eb;border-radius:16px;padding:28px 24px 22px;box-shadow:0 1px 6px rgba(0,0,0,.05)">
+
+    <!-- Header -->
+    <div style="margin-bottom:20px">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:5px">
+        <span style="font-size:22px;line-height:1">🩺</span>
+        <h2 style="font-size:18px;font-weight:700;color:#1a1a2e;margin:0">Is My Doctor In-Network?</h2>
+      </div>
+      <p style="font-size:13px;color:#6b7280;margin:0 0 0 32px">Search by specialty or doctor name to see who's covered near your ZIP code.</p>
+    </div>
+
+    <!-- Tabs -->
+    <div style="display:flex;border-bottom:2px solid #f0f1f4;margin-bottom:20px">
+      <button id="pvTabSpec" onclick="pvTab('spec')"
+        style="padding:8px 18px;border:none;background:none;font-family:inherit;font-size:13px;font-weight:600;color:#3b82f6;border-bottom:2px solid #3b82f6;margin-bottom:-2px;cursor:pointer">
+        Search by Specialty
+      </button>
+      <button id="pvTabName" onclick="pvTab('name')"
+        style="padding:8px 18px;border:none;background:none;font-family:inherit;font-size:13px;font-weight:500;color:#9ca3af;border-bottom:2px solid transparent;margin-bottom:-2px;cursor:pointer">
+        Find a Doctor by Name
+      </button>
+    </div>
+
+    <!-- ── Specialty Tab ─────────────────────────────────────── -->
+    <div id="pvTabSpecPanel">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+        <div class="field">
+          <label>Specialty</label>
+          <div style="position:relative">
+            <input type="text" id="pvSpecInp" placeholder="e.g. Cardiologist, Dermatologist…"
+              autocomplete="off" spellcheck="false"
+              style="width:100%;padding:9px 12px;border:1px solid #e0e3eb;border-radius:8px;font-size:14px;background:#fff;color:#1a1a2e;outline:none;font-family:inherit;box-sizing:border-box">
+            <div id="pvSpecDrp"
+              style="display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;background:#fff;border:1px solid #e0e3eb;border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,.1);z-index:300;overflow:hidden"></div>
+          </div>
+        </div>
+        <div class="field">
+          <label>ZIP Code</label>
+          <input type="text" id="pvZipInp" placeholder="e.g. 77041" maxlength="5" inputmode="numeric"
+            style="width:100%;padding:9px 12px;border:1px solid #e0e3eb;border-radius:8px;font-size:14px;background:#fff;color:#1a1a2e;outline:none;font-family:inherit;box-sizing:border-box">
+        </div>
+      </div>
+
+      <!-- Network pills -->
+      <div style="margin-bottom:16px">
+        <div style="font-size:12px;color:#6b7280;font-weight:500;margin-bottom:8px">Networks to search</div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap" id="pvNetSel">
+          <label class="pvpill" data-net="uhc" data-color="#1a2f6b" data-bg="#EEF2FF"
+            style="border-color:#1a2f6b;background:#EEF2FF;color:#1a2f6b;font-weight:600">
+            <input type="checkbox" class="pvnet" value="uhc" checked style="display:none"> UHC PPO
+          </label>
+          <label class="pvpill" data-net="aetna" data-color="#7B2D8B" data-bg="#F5F3FF">
+            <input type="checkbox" class="pvnet" value="aetna" style="display:none"> Aetna PPO
+          </label>
+          <label class="pvpill" data-net="phcs" data-color="#1D9E75" data-bg="#ECFDF5">
+            <input type="checkbox" class="pvnet" value="phcs" style="display:none"> PHCS PPO
+          </label>
+          <label class="pvpill" data-net="fh" data-color="#B86B0A" data-bg="#FFF7ED">
+            <input type="checkbox" class="pvnet" value="fh" style="display:none"> First Health PPO
+          </label>
+        </div>
+      </div>
+
+      <button onclick="pvSearch('spec')"
+        style="width:100%;padding:12px;background:#1a2f6b;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;transition:background .15s"
+        onmouseover="this.style.background='#3b82f6'" onmouseout="this.style.background='#1a2f6b'">
+        🔍 Find In-Network Providers
+      </button>
+    </div>
+
+    <!-- ── Name Tab ──────────────────────────────────────────── -->
+    <div id="pvTabNamePanel" style="display:none">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">
+        <div class="field">
+          <label>Doctor's Name</label>
+          <input type="text" id="pvDrName" placeholder="e.g. John Smith or Smith"
+            style="width:100%;padding:9px 12px;border:1px solid #e0e3eb;border-radius:8px;font-size:14px;background:#fff;color:#1a1a2e;outline:none;font-family:inherit;box-sizing:border-box">
+        </div>
+        <div class="field">
+          <label>ZIP Code</label>
+          <input type="text" id="pvDrZip" placeholder="e.g. 77041" maxlength="5" inputmode="numeric"
+            style="width:100%;padding:9px 12px;border:1px solid #e0e3eb;border-radius:8px;font-size:14px;background:#fff;color:#1a1a2e;outline:none;font-family:inherit;box-sizing:border-box">
+        </div>
+      </div>
+      <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 12px;font-size:12px;color:#92400e;margin-bottom:14px;line-height:1.5">
+        ⓘ Name search checks UHC Choice Plus first — the largest of the four networks. Results show which plans include this provider near your ZIP.
+      </div>
+      <button onclick="pvSearch('name')"
+        style="width:100%;padding:12px;background:#1a2f6b;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;transition:background .15s"
+        onmouseover="this.style.background='#3b82f6'" onmouseout="this.style.background='#1a2f6b'">
+        🔍 Check Network Coverage
+      </button>
+    </div>
+
+    <!-- Results -->
+    <div id="pvResults" style="display:none;margin-top:22px;border-top:1px solid #f0f1f4;padding-top:20px"></div>
+
+    <p style="font-size:11px;color:#b0b6c3;margin-top:18px;line-height:1.6;margin-bottom:0">
+      ⓘ Provider data sourced in real-time from UHC, Aetna, PHCS, and First Health. Results are for informational purposes — verify network status with your provider before scheduling. Searches may take 15–45 seconds per network.
+    </p>
+  </div>
+</div>
+
+<style>
+.pvpill {
+  display:flex;align-items:center;gap:5px;
+  padding:6px 14px;border:1.5px solid #e0e3eb;
+  border-radius:20px;cursor:pointer;font-size:12px;
+  font-weight:500;color:#6b7280;background:#fff;
+  user-select:none;font-family:inherit;
+  transition:all .12s;
+}
+</style>
+
+<script>
+(function(){
+// ── CONFIG — change to your deployed server URL when live ──────────────────
+var PV_API = 'http://localhost:3001';
+
+// ── NETWORK METADATA ───────────────────────────────────────────────────────
+var PV_NET = {
+  uhc:   { label:'UHC Choice Plus',       color:'#1a2f6b', light:'#EEF2FF', planKey:'uhc'   },
+  aetna: { label:'Aetna Open Choice PPO', color:'#7B2D8B', light:'#F5F3FF', planKey:'aetna' },
+  phcs:  { label:'PHCS PPO',              color:'#1D9E75', light:'#ECFDF5', planKey:'phcs'  },
+  fh:    { label:'First Health PPO',      color:'#B86B0A', light:'#FFF7ED', planKey:'cigna' },
+};
+
+// ── SPECIALTIES (for autocomplete) ────────────────────────────────────────
+var PV_SPECS = [
+  'Allergist','Anesthesiologist','Cardiologist','Chiropractor',
+  'Dermatologist','Endocrinologist','Family Medicine','Gastroenterologist',
+  'General Surgeon','Hematologist','Infectious Disease',
+  'Internal Medicine','Nephrologist','Neurologist',
+  'OB/GYN','Oncologist','Ophthalmologist','Optometrist',
+  'Orthopedic Surgeon','Otolaryngologist','Physical Therapist',
+  'Plastic Surgeon','Podiatrist','Primary Care','Psychiatrist',
+  'Psychologist','Pulmonologist','Radiologist',
+  'Rheumatologist','Urologist','Vascular Surgeon',
+];
+
+// ── TABS ───────────────────────────────────────────────────────────────────
+window.pvTab = function(t) {
+  ['spec','name'].forEach(function(k) {
+    var active = k === t;
+    var btn = document.getElementById('pvTab' + k.charAt(0).toUpperCase() + k.slice(1));
+    var pnl = document.getElementById('pvTab' + k.charAt(0).toUpperCase() + k.slice(1) + 'Panel');
+    btn.style.color = active ? '#3b82f6' : '#9ca3af';
+    btn.style.fontWeight = active ? '600' : '500';
+    btn.style.borderBottom = active ? '2px solid #3b82f6' : '2px solid transparent';
+    pnl.style.display = active ? '' : 'none';
+  });
+  document.getElementById('pvResults').style.display = 'none';
+};
+
+// ── SPECIALTY AUTOCOMPLETE ─────────────────────────────────────────────────
+var pvInp = document.getElementById('pvSpecInp');
+var pvDrp = document.getElementById('pvSpecDrp');
+
+function pvShowDrop() {
+  var q = pvInp.value.toLowerCase().trim();
+  var hits = PV_SPECS.filter(function(s) {
+    return s.toLowerCase().includes(q);
+  }).slice(0, 8);
+  if (!hits.length || !q) { pvDrp.style.display = 'none'; return; }
+  pvDrp.innerHTML = hits.map(function(s) {
+    return '<div class="_pvsi" style="padding:9px 14px;cursor:pointer;font-size:13px;color:#1a1a2e;border-bottom:1px solid #f3f4f6">' + s + '</div>';
+  }).join('');
+  pvDrp.querySelectorAll('._pvsi').forEach(function(el) {
+    el.addEventListener('mouseenter', function() { el.style.background = '#f0f9ff'; });
+    el.addEventListener('mouseleave', function() { el.style.background = ''; });
+    el.addEventListener('mousedown', function() {
+      pvInp.value = el.textContent;
+      pvDrp.style.display = 'none';
+    });
+  });
+  pvDrp.style.display = 'block';
+}
+pvInp.addEventListener('input', pvShowDrop);
+pvInp.addEventListener('focus', pvShowDrop);
+document.addEventListener('click', function(e) {
+  if (!pvInp.contains(e.target) && !pvDrp.contains(e.target)) {
+    pvDrp.style.display = 'none';
+  }
+});
+
+// ── NETWORK PILL TOGGLES ───────────────────────────────────────────────────
+document.querySelectorAll('.pvpill').forEach(function(lbl) {
+  lbl.addEventListener('click', function() {
+    setTimeout(function() {
+      var cb = lbl.querySelector('input');
+      if (cb.checked) {
+        lbl.style.borderColor = lbl.dataset.color;
+        lbl.style.background  = lbl.dataset.bg;
+        lbl.style.color       = lbl.dataset.color;
+        lbl.style.fontWeight  = '600';
+      } else {
+        lbl.style.borderColor = '#e0e3eb';
+        lbl.style.background  = '#fff';
+        lbl.style.color       = '#6b7280';
+        lbl.style.fontWeight  = '500';
+      }
+    }, 0);
+  });
+});
+
+// ── SEARCH ─────────────────────────────────────────────────────────────────
+window.pvSearch = async function(mode) {
+  var resEl = document.getElementById('pvResults');
+  var specialty, zip, networks;
+
+  if (mode === 'spec') {
+    specialty = pvInp.value.trim();
+    zip       = document.getElementById('pvZipInp').value.trim();
+    networks  = Array.from(document.querySelectorAll('.pvnet:checked')).map(function(c) { return c.value; });
+    if (!specialty)             { pvInp.style.borderColor='#f87171'; pvInp.focus(); return; }
+    if (zip.length < 5)         { var zi=document.getElementById('pvZipInp'); zi.style.borderColor='#f87171'; zi.focus(); return; }
+    if (!networks.length)       { alert('Select at least one network.'); return; }
+    pvInp.style.borderColor='#e0e3eb';
+    document.getElementById('pvZipInp').style.borderColor='#e0e3eb';
+  } else {
+    specialty = document.getElementById('pvDrName').value.trim();
+    zip       = document.getElementById('pvDrZip').value.trim();
+    networks  = ['uhc']; // name search uses UHC's free-text search
+    if (!specialty)       { var ni=document.getElementById('pvDrName'); ni.style.borderColor='#f87171'; ni.focus(); return; }
+    if (zip.length < 5)   { var dzi=document.getElementById('pvDrZip'); dzi.style.borderColor='#f87171'; dzi.focus(); return; }
+  }
+
+  // Loading
+  resEl.style.display = 'block';
+  resEl.innerHTML =
+    '<div style="text-align:center;padding:30px 0">'
+    + '<div style="font-size:30px;display:inline-block;animation:pv-spin 1s linear infinite">⏳</div>'
+    + '<p style="font-size:14px;font-weight:600;color:#1a1a2e;margin:10px 0 4px">Searching '
+    + networks.length + ' network' + (networks.length > 1 ? 's' : '') + '…</p>'
+    + '<p style="font-size:12px;color:#9ca3af;margin:0">This may take up to 45 seconds — real-time data from each carrier.</p>'
+    + '</div>';
+
+  var t0 = Date.now();
+  try {
+    var resp = await fetch(PV_API + '/api/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ specialty: specialty, zip: zip, networks: networks }),
+    });
+    if (!resp.ok) throw new Error('Server returned ' + resp.status);
+    var data = await resp.json();
+    pvRender(data, specialty, zip, Date.now() - t0);
+  } catch (e) {
+    resEl.innerHTML =
+      '<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:16px 18px;font-size:13px;color:#dc2626">'
+      + '<strong>⚠️ Could not reach the provider search server.</strong><br>'
+      + 'Make sure <code style="background:#fee2e2;padding:1px 5px;border-radius:3px">node server.js</code> is running.<br>'
+      + '<span style="font-size:11px;color:#9ca3af">(' + e.message + ')</span>'
+      + '</div>';
+  }
+};
+
+// ── RENDER RESULTS ─────────────────────────────────────────────────────────
+function pvRender(data, query, zip, ms) {
+  var resEl = document.getElementById('pvResults');
+  var html = '';
+  var results = data.results || {};
+  var errors  = data.errors  || {};
+
+  var total = Object.values(results).reduce(function(s, arr) { return s + arr.length; }, 0);
+
+  // Summary bar
+  html += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:6px">';
+  html += '<p style="font-size:13px;font-weight:600;color:#1a1a2e;margin:0">';
+  html += total ? '✅ Found <strong>' + total + ' provider' + (total !== 1 ? 's' : '') + '</strong> matching "' + query + '" near ' + zip
+                : '⚠️ No providers found for "' + query + '" near ' + zip;
+  html += '</p><span style="font-size:11px;color:#9ca3af">' + (ms/1000).toFixed(1) + 's</span></div>';
+
+  // Error notices
+  Object.entries(errors).forEach(function(kv) {
+    var cfg = PV_NET[kv[0]];
+    html += '<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:9px 12px;font-size:12px;color:#92400e;margin-bottom:10px">'
+      + '⚠️ ' + (cfg ? cfg.label : kv[0]) + ': ' + kv[1]
+      + '</div>';
+  });
+
+  // Per-network results
+  Object.entries(results).forEach(function(kv) {
+    var net = kv[0];
+    var providers = kv[1].slice(0, 6);
+    var allCount  = kv[1].length;
+    var cfg = PV_NET[net];
+    if (!cfg) return;
+
+    html += '<div style="margin-bottom:22px">';
+
+    // Network header
+    html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">'
+      + '<span style="font-size:12px;font-weight:700;color:' + cfg.color + ';background:' + cfg.light + ';padding:3px 12px;border-radius:20px">' + cfg.label + '</span>';
+    if (errors[net]) {
+      html += '<span style="font-size:11px;color:#dc2626">Search error</span>';
+    } else if (allCount === 0) {
+      html += '<span style="font-size:11px;color:#9ca3af">No results</span>';
+    } else {
+      html += '<span style="font-size:11px;color:#6b7280">' + allCount + ' provider' + (allCount !== 1 ? 's' : '') + ' found</span>';
+    }
+    html += '</div>';
+
+    // Provider cards
+    if (providers.length) {
+      html += '<div style="display:grid;gap:8px">';
+      providers.forEach(function(p) {
+        var isOrg = (p.providerType || '').toLowerCase().includes('group') ||
+                    (p.providerType || '').toLowerCase() === 'organization';
+        var icon = isOrg ? '🏥' : '👨‍⚕️';
+        var addr = p.address || {};
+
+        html += '<div style="border:1.5px solid ' + cfg.color + '33;border-radius:10px;padding:12px 14px;background:#fff;display:flex;gap:10px;align-items:flex-start">';
+        // Icon
+        html += '<div style="font-size:20px;line-height:1;flex-shrink:0;padding-top:1px">' + icon + '</div>';
+        // Details
+        html += '<div style="flex:1;min-width:0">';
+        html += '<p style="font-size:13px;font-weight:600;color:#1a1a2e;margin:0 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + pvEsc(p.name || 'Unknown') + '</p>';
+        if (p.specialty) {
+          html += '<p style="font-size:11px;color:#6b7280;margin:0 0 4px">' + pvEsc(p.specialty) + '</p>';
+        }
+        var addrParts = [addr.street, addr.city, addr.state].filter(Boolean);
+        if (addr.building && addr.building !== p.name) addrParts.unshift(addr.building);
+        if (addrParts.length) {
+          html += '<p style="font-size:11px;color:#6b7280;margin:0 0 5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + pvEsc(addrParts.join(', ')) + (addr.zip ? ' ' + addr.zip : '') + '</p>';
+        }
+        // Tag chips
+        html += '<div style="display:flex;gap:4px;flex-wrap:wrap">';
+        if (p.distance)             html += pvChip('📍 ' + p.distance.toFixed(1) + ' mi',        '#1d4ed8','#dbeafe');
+        if (p.acceptingNewPatients) html += pvChip('✓ Accepting',                                 '#166534','#dcfce7');
+        if (p.virtualVisits)        html += pvChip('💻 Virtual',                                   '#5b21b6','#ede9fe');
+        if (p.inNetwork !== false)  html += pvChip('In-network',                                   cfg.color, cfg.light);
+        if (p.smartChoiceScore)     html += pvChip('★ Smart Choice ' + p.smartChoiceScore + '%', '#92400e','#fef3c7');
+        html += '</div></div>';
+        // Phone
+        if (p.phone) {
+          var raw = p.phone.replace(/\D/g,'');
+          var ph  = raw.length === 10 ? '(' + raw.slice(0,3) + ') ' + raw.slice(3,6) + '-' + raw.slice(6) : p.phone;
+          html += '<a href="tel:' + raw + '" style="flex-shrink:0;font-size:11px;color:' + cfg.color + ';font-weight:600;text-decoration:none;white-space:nowrap">' + ph + '</a>';
+        }
+        html += '</div>';
+      });
+      html += '</div>';
+
+      if (allCount > 6) {
+        html += '<p style="font-size:11px;color:#9ca3af;margin:8px 0 0;text-align:right">Showing 6 of ' + allCount + ' — try a narrower specialty to see fewer, more relevant results.</p>';
+      }
+    } else if (!errors[net]) {
+      html += '<p style="font-size:12px;color:#9ca3af;padding:10px 0">No providers found on this network for this search.</p>';
+    }
+
+    // CTA to jump to this network's plans
+    html += '<button onclick="pvGoPlans(\'' + cfg.planKey + '\')" '
+      + 'style="margin-top:10px;padding:7px 14px;background:' + cfg.light + ';color:' + cfg.color + ';border:1.5px solid ' + cfg.color + ';border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit">'
+      + 'View ' + cfg.label + ' plan rates →'
+      + '</button>';
+
+    html += '</div>';
+  });
+
+  if (!total && !Object.keys(errors).length) {
+    html += '<div style="background:#f9fafb;border-radius:10px;padding:20px;text-align:center;color:#9ca3af;font-size:13px">Try a broader specialty or a different ZIP code.</div>';
+  }
+
+  resEl.innerHTML = html;
+}
+
+// ── HELPERS ────────────────────────────────────────────────────────────────
+function pvChip(text, color, bg) {
+  return '<span style="font-size:10px;background:' + bg + ';color:' + color + ';border-radius:4px;padding:2px 6px;white-space:nowrap">' + text + '</span>';
+}
+function pvEsc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+window.pvGoPlans = function(key) {
+  if (typeof setC === 'function') {
+    setC(key);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+};
+
+})();
+</script>
