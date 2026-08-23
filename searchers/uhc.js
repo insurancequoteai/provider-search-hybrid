@@ -155,34 +155,24 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
     await page.waitForTimeout(4000);
     console.log(`[UHC] find-care loaded: ${page.url()}`);
 
-    // Step 3: Dismiss any modal / overlay that would intercept pointer events
+    // Step 3: Dismiss modal if present
     await page.evaluate(() => {
-      // Click close buttons on any visible modal
-      const closeSelectors = [
+      const selectors = [
         'button[aria-label="close"]', 'button[aria-label="Close"]',
         '[data-testid="modal-close"]', '[aria-label="Close dialog"]',
-        '.abyss-icon-button', 'button[class*="close" i]', '[class*="modal"] button',
+        '.abyss-icon-button',
       ];
-      for (const sel of closeSelectors) {
+      for (const sel of selectors) {
         const el = document.querySelector(sel);
-        if (el && el.offsetParent !== null) { el.click(); break; }
+        if (el && el.offsetParent !== null) { el.click(); return; }
       }
-      // Also remove any fixed overlays that block pointer events
-      document.querySelectorAll('[class*="overlay" i], [class*="backdrop" i], [class*="modal" i]').forEach(el => {
-        const style = window.getComputedStyle(el);
-        if (style.position === 'fixed' || style.position === 'absolute') {
-          el.style.pointerEvents = 'none';
-        }
-      });
     });
     await page.waitForTimeout(1000);
 
-    // Step 4: Find the main search input (unified search: doctors/hospitals/names)
-    await page.waitForSelector('input[role="combobox"], input[type="search"], input[type="text"]', { timeout: 20000 }).catch(() => {});
+    // Step 4: Find search combobox (avoid ZIP/location fields)
+    await page.waitForSelector('input[role="combobox"]', { timeout: 20000 }).catch(() => {});
 
-    // The unified search page has ALL selected by default (doctors/hospitals/names)
-    // Find the search input — avoid the ZIP/location field
-    const allComboboxes = await page.locator('input[role="combobox"], input[type="search"]').all();
+    const allComboboxes = await page.locator('input[role="combobox"]').all();
     let searchInput = null;
 
     for (const cb of allComboboxes) {
@@ -202,8 +192,10 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
         if (!visible) continue;
         const ph = await inp.getAttribute('placeholder').catch(() => '') || '';
         if (ph.match(/zip|city|location|address/i)) continue;
-        searchInput = inp;
-        break;
+        if (ph.match(/name|specialty|doctor|provider|search/i) || ph.length > 0) {
+          searchInput = inp;
+          break;
+        }
       }
     }
 
@@ -211,32 +203,19 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
       throw new Error('UHC: could not find search input');
     }
 
-    // Step 4: Type search term — use evaluate to bypass any overlay/interceptor
+    // Step 5: Type search term and wait for GraphQL response
     const searchDone = new Promise(resolve => {
-      setTimeout(resolve, 30000);
+      setTimeout(resolve, 25000);
       const check = setInterval(() => {
         if (providerBatches.length > 0) { clearInterval(check); setTimeout(resolve, 2000); }
       }, 200);
     });
 
-    // Focus and clear via JS (bypasses pointer-event interception from overlays)
-    await page.evaluate(() => {
-      const el = document.querySelector(
-        'input[role="combobox"], input[type="search"], input[placeholder*="doctor" i], input[placeholder*="name" i], input[placeholder*="search" i], input[placeholder*="specialty" i]'
-      );
-      if (el) {
-        el.focus();
-        el.value = '';
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-      }
-    });
-    await page.waitForTimeout(300);
-
-    // Type the search term character by character via keyboard (field already focused)
-    await page.keyboard.type(searchTerm, { delay: 80 });
+    await searchInput.click();
+    await searchInput.type(searchTerm, { delay: 80 });
     await page.waitForTimeout(1500);
 
-    // Step 5: Handle autocomplete dropdown
+    // Step 6: Handle autocomplete dropdown
     await page.waitForSelector('[role="option"]', { timeout: 8000 }).catch(() => {});
     const options = await page.locator('[role="option"]').all();
 
