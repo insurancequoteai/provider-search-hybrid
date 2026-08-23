@@ -283,15 +283,22 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
 
     await page.waitForTimeout(500);
 
-    // Step 7: Click Search button if present
+    // Step 7: Click Search button (try multiple patterns, fall back to Enter)
     const searchBtnFound = await page.evaluate(() => {
-      const btn = Array.from(document.querySelectorAll('button')).find(b =>
-        b.textContent?.trim().toLowerCase() === 'search' && b.offsetParent !== null
-      );
-      if (btn) { btn.click(); return true; }
-      return false;
+      const btns = Array.from(document.querySelectorAll('button'));
+      // Try exact "search" text, then any button containing "search" or "find"
+      const btn = btns.find(b => b.textContent?.trim().toLowerCase() === 'search' && b.offsetParent !== null)
+        || btns.find(b => /search|find|go/i.test(b.textContent?.trim()) && b.offsetParent !== null && b.type !== 'reset')
+        || btns.find(b => b.getAttribute('aria-label') && /search|find/i.test(b.getAttribute('aria-label')) && b.offsetParent !== null);
+      if (btn) { btn.click(); return btn.textContent?.trim().substring(0, 30) || 'found'; }
+      return null;
     });
-    console.log(`[UHC] Search button clicked: ${searchBtnFound}`);
+    console.log(`[UHC] Search button: ${searchBtnFound}`);
+    if (!searchBtnFound) {
+      // No button found — press Enter to submit
+      await page.keyboard.press('Enter');
+      console.log('[UHC] Search button not found, pressed Enter');
+    }
 
     await searchDone;
     await page.waitForTimeout(2000);
