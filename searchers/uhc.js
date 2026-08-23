@@ -34,6 +34,38 @@ function zipToLatLon(zip) {
 }
 
 /**
+ * Normalize a UHC AutoComplete provData entry to the standard provider shape.
+ * AutoComplete fields: displayName, displayAddress (string), locationId, providerId,
+ * providerType, speciality (array of {description, providerType, category}).
+ */
+function normalizeAutoCompleteProvider(p) {
+  const spec = Array.isArray(p.speciality) ? p.speciality : [];
+  // displayAddress: "8821 Valley View St, Buena Park, Orange County, CA, 90620"
+  const addrParts = (p.displayAddress || '').split(',').map(s => s.trim());
+  const zip   = addrParts.slice(-1)[0] || '';
+  const state = addrParts.slice(-2, -1)[0] || '';
+  const city  = addrParts.slice(-3, -2)[0] || '';
+  const street = addrParts.slice(0, -3).join(', ');
+  return {
+    providerName: p.displayName || '',
+    npi: p.npi || '',
+    providerId: p.providerId || '',
+    locationId: p.locationId || '',
+    providerType: p.providerType || '',
+    speciality: spec[0]?.description || '',
+    specialities: spec.map(s => ({ value: s.description })),
+    address: { street, city, state, zip },
+    phones: p.phones || {},
+    distance: parseFloat(p.distance) || null,
+    latitude: parseFloat(p.latitude) || null,
+    longitude: parseFloat(p.longitude) || null,
+    acceptingNewPatients: p.acceptingNewPatients === true,
+    networkStatus: 'INN',
+    virtualIndicator: 'N',
+  };
+}
+
+/**
  * @param {object} opts
  * @param {string} [opts.specialty]  - e.g. "Cardiologist" (search by specialty/condition)
  * @param {string} [opts.name]       - e.g. "Dr. Smith" or "John Smith" (search by provider name)
@@ -79,12 +111,10 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
 
     const providerBatches = [];
 
-    // Intercept GraphQL ProviderSearch requests and patch lat/lon/state to match requested ZIP
+    // Intercept GraphQL requests and patch lat/lon/state to match requested ZIP
     await page.route('**graphql**', async route => {
       const request = route.request();
-      if (!request.url().includes('ProviderSearch') || !geoData) {
-        return route.continue();
-      }
+      if (!geoData) return route.continue();
       try {
         const body = request.postDataJSON();
         if (body?.variables) {
@@ -128,66 +158,13 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
         }
 
         // AutoComplete response — for name search, extract provider suggestions
+        // Structure: body.data.autoComplete.practitioners_uhc.provData[]
         if (isNameSearch && url.includes('q=AutoComplete')) {
-          // Log full body to understand structure
-          console.log(`[UHC] AutoComplete body keys: ${JSON.stringify(Object.keys(body?.data || {}))}`);
-          console.log(`[UHC] AutoComplete raw: ${JSON.stringify(body?.data).substring(0, 600)}`);
-
-          // Try every known path for autocomplete suggestions
-          const ac = body?.data?.autoComplete;
-          const candidates = [
-            ac,
-            ac?.suggestions,
-            ac?.searchSuggestions,
-            ac?.results,
-            ac?.providers,
-            ac?.items,
-            body?.data?.suggestions,
-            body?.data?.providers,
-          ];
-
-          let list = null;
-          for (const c of candidates) {
-            if (Array.isArray(c) && c.length > 0) { list = c; break; }
-          }
-
-          // If ac itself is an object with sub-arrays, find first array
-          if (!list && ac && typeof ac === 'object') {
-            for (const k of Object.keys(ac)) {
-              if (Array.isArray(ac[k]) && ac[k].length > 0) { list = ac[k]; break; }
-            }
-          }
-
-          if (list && list.length > 0) {
-            console.log(`[UHC] AutoComplete raw sample: ${JSON.stringify(list[0]).substring(0, 300)}`);
-            const providerSuggestions = list.filter(s =>
-              s?.type === 'PROVIDER' || s?.providerName || s?.npi ||
-              s?.suggestionType === 'PROVIDER' || /provider/i.test(s?.type || '') ||
-              s?.displayText || s?.name
-            );
-            console.log(`[UHC] AutoComplete providers found: ${providerSuggestions.length} of ${list.length}`);
-            if (providerSuggestions.length > 0) {
-              const normalized = providerSuggestions.map(s => ({
-                providerName: s.providerName || s.displayText || s.name || s.text || s.label || '',
-                npi: s.npi || s.nationalProviderId || '',
-                providerId: s.providerId || s.id || '',
-                locationId: s.locationId || '',
-                providerType: s.providerType || s.type || '',
-                speciality: s.specialty || s.speciality || '',
-                specialities: s.specialties || s.specialities || [],
-                address: s.address || {},
-                phones: s.phones || {},
-                distance: s.distance,
-                latitude: s.latitude,
-                longitude: s.longitude,
-                acceptingNewPatients: s.acceptingNewPatients,
-                networkStatus: s.networkStatus || 'INN',
-                virtualIndicator: s.virtualCare ? 'Y' : 'N',
-              }));
-              providerBatches.push(normalized);
-            }
-          } else {
-            console.log(`[UHC] AutoComplete: no list found — full body: ${JSON.stringify(body).substring(0, 400)}`);
+          const provData = body?.data?.autoComplete?.practitioners_uhc?.provData;
+          if (Array.isArray(provData) && provData.length > 0) {
+            console.log(`[UHC] AutoComplete provData found: ${provData.length} providers`);
+            const normalized = provData.map(p => normalizeAutoCompleteProvider(p));
+            providerBatches.push(normalized);
           }
           return;
         }
@@ -410,35 +387,53 @@ async function suggestUHC({ name, zip = '77041' } = {}) {
 
     let suggestions = [];
 
+    // Patch AutoComplete requests to use the correct ZIP lat/lon
+    await page.route('**graphql**', async route => {
+      const request = route.request();
+      if (!geoData) return route.continue();
+      try {
+        const body = request.postDataJSON();
+        if (body?.variables) {
+          const v = body.variables;
+          if (v.latitude !== undefined)  v.latitude  = geoData.latitude;
+          if (v.longitude !== undefined) v.longitude = geoData.longitude;
+          if (v.stateCode !== undefined) v.stateCode = geoData.stateCode;
+          if (v.searchLocation) {
+            v.searchLocation.latitude  = geoData.latitude;
+            v.searchLocation.longitude = geoData.longitude;
+          }
+          if (typeof v.uniqueSearch === 'string') {
+            v.uniqueSearch = v.uniqueSearch.replace(
+              /suggestion-[\d.-]+-[\d.-]+/,
+              `suggestion-${geoData.latitude}-${geoData.longitude}`
+            );
+          }
+          await route.continue({ postData: JSON.stringify(body) });
+          return;
+        }
+      } catch {}
+      route.continue();
+    });
+
     page.on('response', async res => {
       if (!res.url().includes('findcare.guest.uhc.com/api/graphql')) return;
       if (!res.url().includes('q=AutoComplete')) return;
       try {
         const body = await res.json();
-        const ac = body?.data?.autoComplete;
-        const candidates = [ac, ac?.suggestions, ac?.searchSuggestions, ac?.results, ac?.items, body?.data?.suggestions];
-        let list = null;
-        for (const c of candidates) {
-          if (Array.isArray(c) && c.length > 0) { list = c; break; }
-        }
-        if (!list && ac && typeof ac === 'object') {
-          for (const k of Object.keys(ac)) {
-            if (Array.isArray(ac[k]) && ac[k].length > 0) { list = ac[k]; break; }
-          }
-        }
-        if (list) {
-          console.log(`[UHC suggest] AutoComplete raw: ${JSON.stringify(list[0]).substring(0, 200)}`);
-          suggestions = list.map(s => ({
-            providerName: s.providerName || s.displayText || s.name || s.text || s.label || '',
-            npi: s.npi || '',
-            providerId: s.providerId || s.id || '',
-            locationId: s.locationId || '',
-            specialty: s.specialty || s.speciality || '',
-            type: s.type || s.suggestionType || '',
-            address: s.address || {},
-          })).filter(s => s.providerName);
-        } else {
-          console.log(`[UHC suggest] AutoComplete body: ${JSON.stringify(body?.data).substring(0, 400)}`);
+        const provData = body?.data?.autoComplete?.practitioners_uhc?.provData;
+        if (Array.isArray(provData) && provData.length > 0) {
+          console.log(`[UHC suggest] provData found: ${provData.length} for "${name}"`);
+          suggestions = provData.map(p => {
+            const norm = normalizeAutoCompleteProvider(p);
+            return {
+              providerName: norm.providerName,
+              npi: norm.npi,
+              providerId: norm.providerId,
+              locationId: norm.locationId,
+              specialty: norm.speciality,
+              address: norm.address,
+            };
+          }).filter(s => s.providerName);
         }
       } catch {}
     });
