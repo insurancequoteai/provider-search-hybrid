@@ -361,15 +361,20 @@ function pvRender(data, query, zip, ms) {
       + '</div>';
   });
 
+  // Store all results for "Show More" batching (keyed by net)
+  var pvAllProviders = {};
+
   // Per-network results
   Object.entries(results).forEach(function(kv) {
     var net = kv[0];
-    var providers = kv[1].slice(0, 6);
-    var allCount  = kv[1].length;
+    var allProviders = kv[1];
+    var allCount     = allProviders.length;
     var cfg = PV_NET[net];
     if (!cfg) return;
 
-    html += '<div style="margin-bottom:22px">';
+    pvAllProviders[net] = allProviders; // save for show-more
+
+    html += '<div style="margin-bottom:22px" id="pvNet-' + net + '">';
 
     // Network header
     html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">'
@@ -383,49 +388,22 @@ function pvRender(data, query, zip, ms) {
     }
     html += '</div>';
 
-    // Provider cards
-    if (providers.length) {
-      html += '<div style="display:grid;gap:8px">';
-      providers.forEach(function(p) {
-        var isOrg = (p.providerType || '').toLowerCase().includes('group') ||
-                    (p.providerType || '').toLowerCase() === 'organization';
-        var icon = isOrg ? '🏥' : '👨‍⚕️';
-        var addr = p.address || {};
+    // Provider cards — first batch of 6
+    var BATCH = 6;
+    var firstBatch = allProviders.slice(0, BATCH);
 
-        html += '<div style="border:1.5px solid ' + cfg.color + '33;border-radius:10px;padding:12px 14px;background:#fff;display:flex;gap:10px;align-items:flex-start">';
-        // Icon
-        html += '<div style="font-size:20px;line-height:1;flex-shrink:0;padding-top:1px">' + icon + '</div>';
-        // Details
-        html += '<div style="flex:1;min-width:0">';
-        html += '<p style="font-size:13px;font-weight:600;color:#1a1a2e;margin:0 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + pvEsc(p.name || 'Unknown') + '</p>';
-        if (p.specialty) {
-          html += '<p style="font-size:11px;color:#6b7280;margin:0 0 4px">' + pvEsc(p.specialty) + '</p>';
-        }
-        var addrParts = [addr.street, addr.city, addr.state].filter(Boolean);
-        if (addr.building && addr.building !== p.name) addrParts.unshift(addr.building);
-        if (addrParts.length) {
-          html += '<p style="font-size:11px;color:#6b7280;margin:0 0 5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + pvEsc(addrParts.join(', ')) + (addr.zip ? ' ' + addr.zip : '') + '</p>';
-        }
-        // Tag chips
-        html += '<div style="display:flex;gap:4px;flex-wrap:wrap">';
-        if (p.distance)             html += pvChip('📍 ' + p.distance.toFixed(1) + ' mi',        '#1d4ed8','#dbeafe');
-        if (p.acceptingNewPatients) html += pvChip('✓ Accepting',                                 '#166534','#dcfce7');
-        if (p.virtualVisits)        html += pvChip('💻 Virtual',                                   '#5b21b6','#ede9fe');
-        if (p.inNetwork !== false)  html += pvChip('In-network',                                   cfg.color, cfg.light);
-        if (p.smartChoiceScore)     html += pvChip('★ Smart Choice ' + p.smartChoiceScore + '%', '#92400e','#fef3c7');
-        html += '</div></div>';
-        // Phone
-        if (p.phone) {
-          var raw = p.phone.replace(/\D/g,'');
-          var ph  = raw.length === 10 ? '(' + raw.slice(0,3) + ') ' + raw.slice(3,6) + '-' + raw.slice(6) : p.phone;
-          html += '<a href="tel:' + raw + '" style="flex-shrink:0;font-size:11px;color:' + cfg.color + ';font-weight:600;text-decoration:none;white-space:nowrap">' + ph + '</a>';
-        }
-        html += '</div>';
-      });
+    if (firstBatch.length) {
+      html += '<div id="pvCards-' + net + '" style="display:grid;gap:8px">';
+      firstBatch.forEach(function(p) { html += pvCard(p, cfg); });
       html += '</div>';
 
-      if (allCount > 6) {
-        html += '<p style="font-size:11px;color:#9ca3af;margin:8px 0 0;text-align:right">Showing 6 of ' + allCount + ' — try a narrower specialty to see fewer, more relevant results.</p>';
+      if (allCount > BATCH) {
+        html += '<button id="pvMore-' + net + '" '
+          + 'onclick="pvShowMore(\'' + net + '\',' + BATCH + ')" '
+          + 'style="margin-top:10px;width:100%;padding:9px;background:#f9fafb;color:#374151;border:1.5px solid #e0e3eb;border-radius:8px;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;transition:background .12s"'
+          + ' onmouseover="this.style.background=\'#f0f9ff\'" onmouseout="this.style.background=\'#f9fafb\'">'
+          + 'Show more (' + (allCount - BATCH) + ' remaining)'
+          + '</button>';
       }
     } else if (!errors[net]) {
       html += '<p style="font-size:12px;color:#9ca3af;padding:10px 0">No providers found on this network for this search.</p>';
@@ -445,6 +423,8 @@ function pvRender(data, query, zip, ms) {
   }
 
   resEl.innerHTML = html;
+  // Make provider data available to pvShowMore after DOM is set
+  window._pvAllProviders = pvAllProviders;
 }
 
 // ── HELPERS ────────────────────────────────────────────────────────────────
@@ -454,6 +434,60 @@ function pvChip(text, color, bg) {
 function pvEsc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
+function pvCard(p, cfg) {
+  var isOrg = (p.providerType || '').toLowerCase().includes('group') ||
+              (p.providerType || '').toLowerCase() === 'organization';
+  var icon = isOrg ? '🏥' : '👨‍⚕️';
+  var addr = p.address || {};
+  var h = '<div style="border:1.5px solid ' + cfg.color + '33;border-radius:10px;padding:12px 14px;background:#fff;display:flex;gap:10px;align-items:flex-start">';
+  h += '<div style="font-size:20px;line-height:1;flex-shrink:0;padding-top:1px">' + icon + '</div>';
+  h += '<div style="flex:1;min-width:0">';
+  h += '<p style="font-size:13px;font-weight:600;color:#1a1a2e;margin:0 0 2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + pvEsc(p.name || 'Unknown') + '</p>';
+  if (p.specialty) h += '<p style="font-size:11px;color:#6b7280;margin:0 0 4px">' + pvEsc(p.specialty) + '</p>';
+  var addrParts = [addr.street, addr.city, addr.state].filter(Boolean);
+  if (addr.building && addr.building !== p.name) addrParts.unshift(addr.building);
+  if (addrParts.length) h += '<p style="font-size:11px;color:#6b7280;margin:0 0 5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + pvEsc(addrParts.join(', ')) + (addr.zip ? ' ' + addr.zip : '') + '</p>';
+  h += '<div style="display:flex;gap:4px;flex-wrap:wrap">';
+  if (p.distance)             h += pvChip('📍 ' + p.distance.toFixed(1) + ' mi', '#1d4ed8','#dbeafe');
+  if (p.acceptingNewPatients) h += pvChip('✓ Accepting',                          '#166534','#dcfce7');
+  if (p.virtualVisits)        h += pvChip('💻 Virtual',                            '#5b21b6','#ede9fe');
+  if (p.inNetwork !== false)  h += pvChip('In-network',                            cfg.color, cfg.light);
+  if (p.smartChoiceScore)     h += pvChip('★ Smart Choice ' + p.smartChoiceScore + '%', '#92400e','#fef3c7');
+  h += '</div></div>';
+  if (p.phone) {
+    var raw = p.phone.replace(/\D/g,'');
+    var ph = raw.length === 10 ? '(' + raw.slice(0,3) + ') ' + raw.slice(3,6) + '-' + raw.slice(6) : p.phone;
+    h += '<a href="tel:' + raw + '" style="flex-shrink:0;font-size:11px;color:' + cfg.color + ';font-weight:600;text-decoration:none;white-space:nowrap">' + ph + '</a>';
+  }
+  h += '</div>';
+  return h;
+}
+
+// Show More: reveal next batch of 6 cards for a network
+window._pvAllProviders = {};
+window.pvShowMore = function(net, shown) {
+  var BATCH = 6;
+  var all = window._pvAllProviders[net] || [];
+  var cfg = PV_NET[net];
+  if (!cfg) return;
+  var next = all.slice(shown, shown + BATCH);
+  var container = document.getElementById('pvCards-' + net);
+  var btn = document.getElementById('pvMore-' + net);
+  if (!container || !next.length) { if (btn) btn.remove(); return; }
+  next.forEach(function(p) {
+    var tmp = document.createElement('div');
+    tmp.innerHTML = pvCard(p, cfg);
+    container.appendChild(tmp.firstChild);
+  });
+  var newShown = shown + next.length;
+  var remaining = all.length - newShown;
+  if (remaining > 0 && btn) {
+    btn.textContent = 'Show more (' + remaining + ' remaining)';
+    btn.setAttribute('onclick', 'pvShowMore(\'' + net + '\',' + newShown + ')');
+  } else if (btn) {
+    btn.remove();
+  }
+};
 window.pvGoPlans = function(key) {
   if (typeof setC === 'function') {
     setC(key);
