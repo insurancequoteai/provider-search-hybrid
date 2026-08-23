@@ -234,11 +234,11 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
               }
             }
             // Deep scan: log structure so we can fix it, and try any array with 2+ items
-            const section = data.getCareTeamPaginated || data.careTeam || data.providerSearch || {};
-            const sectionKeys = Object.keys(section);
+            const inner = data.getCareTeamPaginated || data.careTeam || data.providerSearch || {};
+            const sectionKeys = Object.keys(inner);
             console.log(`[UHC] GetCareTeamPaginated inner keys: ${sectionKeys.join(', ')}`);
             for (const k of sectionKeys) {
-              const v = section[k];
+              const v = inner[k];
               if (Array.isArray(v) && v.length > 0) {
                 console.log(`[UHC] GetCareTeamPaginated found array at "${k}": ${v.length} items, first keys: ${Object.keys(v[0] || {}).slice(0, 6).join(', ')}`);
                 if (v[0]?.providerName || v[0]?.displayName || v[0]?.npi) {
