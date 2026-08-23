@@ -38,6 +38,8 @@ app.post('/api/search', async (req, res) => {
     networks  = ['uhc', 'aetna', 'phcs', 'fh'],
   } = req.body;
 
+  console.log(`[search] name="${name}" specialty="${specialty}" zip="${zip}" networks=${JSON.stringify(networks)}`);
+
   if (!zip && !name && !specialty) {
     return res.status(400).json({ error: 'Provide at least one search parameter.' });
   }
