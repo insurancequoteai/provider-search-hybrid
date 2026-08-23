@@ -229,26 +229,17 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
 
     if (options.length > 0) {
       if (isNameSearch) {
-        // For name search: find which index best matches the name
-        const nameLower = searchTerm.toLowerCase();
-        let targetIndex = 0;
-        for (let i = 0; i < options.length; i++) {
+        // For name search: log the available options, then submit directly with Enter.
+        // Picking an autocomplete option for a name navigates to one specific provider's
+        // profile page rather than a ProviderSearch list, so we bypass the dropdown.
+        for (let i = 0; i < Math.min(options.length, 5); i++) {
           const text = (await options[i].textContent().catch(() => '')) || '';
-          const textLower = text.toLowerCase();
-          if (/specialist|condition|specialty|all providers/i.test(text)) continue;
-          const parts = nameLower.split(/\s+/).filter(p => p.length > 2);
-          if (parts.some(p => textLower.includes(p))) {
-            targetIndex = i;
-            console.log(`[UHC] Name option matched at index ${i}: ${text.substring(0, 60)}`);
-            break;
-          }
+          console.log(`[UHC] Name autocomplete option ${i}: ${text.substring(0, 80)}`);
         }
-        for (let i = 0; i <= targetIndex; i++) {
-          await page.keyboard.press('ArrowDown');
-          await page.waitForTimeout(80);
-        }
-        await page.keyboard.press('Enter');
-        console.log(`[UHC] Name option selected via keyboard (index ${targetIndex})`);
+        await page.keyboard.press('Escape'); // dismiss dropdown
+        await page.waitForTimeout(200);
+        await page.keyboard.press('Enter'); // submit name as free-text search
+        console.log(`[UHC] Name search: dismissed autocomplete, submitted via Enter`);
       } else {
         // Specialty: arrow to first option and select
         const firstText = (await options[0].textContent().catch(() => '')) || '';
