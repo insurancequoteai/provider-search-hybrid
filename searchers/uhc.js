@@ -211,8 +211,10 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
       }, 200);
     });
 
-    await searchInput.click();
-    await searchInput.type(searchTerm, { delay: 80 });
+    // Use JS click + focus to bypass any overlay intercepting pointer events
+    await page.evaluate(el => { el.click(); el.focus(); }, await searchInput.elementHandle());
+    await page.waitForTimeout(300);
+    await page.keyboard.type(searchTerm, { delay: 80 });
     await page.waitForTimeout(1500);
 
     // Step 6: Handle autocomplete dropdown
