@@ -140,49 +140,46 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
       } catch {}
     });
 
-    // Step 1: Navigate — specialty uses the proven URL, name uses the deeplink flow
-    if (isNameSearch) {
-      // Deeplink → ZIP entry page → unified search (supports doctor name search)
-      await page.goto(
-        `https://findcare.guest.uhc.com/guest-plan-selection/browse?deeplink=${CHOICE_PLUS_DEEPLINK}`,
-        { waitUntil: 'domcontentloaded', timeout: 40000 }
-      ).catch(() => {});
-      await page.waitForTimeout(2500);
-      console.log(`[UHC] Name search — deeplink nav: ${page.url()}`);
+    // Step 1: Navigate via Choice Plus deeplink (works for BOTH specialty and name)
+    // Flow: deeplink → ZIP entry page → unified search (ALL: doctors/hospitals/names)
+    await page.goto(
+      `https://findcare.guest.uhc.com/guest-plan-selection/browse?deeplink=${CHOICE_PLUS_DEEPLINK}`,
+      { waitUntil: 'domcontentloaded', timeout: 40000 }
+    ).catch(() => {});
+    await page.waitForTimeout(2500);
+    console.log(`[UHC] After deeplink nav: ${page.url()}`);
 
-      // Enter ZIP on the location/ZIP page
-      const zipFilled = await page.evaluate((z) => {
-        const candidates = Array.from(document.querySelectorAll('input'));
-        const zipInput = candidates.find(el =>
-          /zip|postal|location|city/i.test(el.placeholder || el.getAttribute('aria-label') || el.id || el.name || '')
-        ) || candidates.find(el => el.offsetParent !== null && el.type !== 'hidden');
-        if (!zipInput) return false;
-        zipInput.value = z;
-        zipInput.dispatchEvent(new Event('input',  { bubbles: true }));
-        zipInput.dispatchEvent(new Event('change', { bubbles: true }));
-        return true;
-      }, zip);
-
-      if (zipFilled) {
-        await page.waitForTimeout(800);
-        await page.evaluate(() => {
-          const btn = Array.from(document.querySelectorAll('button, input[type="submit"]')).find(b =>
-            b.offsetParent !== null && /search|continue|submit|find|go/i.test(b.textContent || b.value || '')
-          );
-          if (btn) btn.click();
-        });
-        await page.waitForTimeout(3000);
-        console.log(`[UHC] After ZIP submit: ${page.url()}`);
-      }
+    // Step 2: Enter ZIP on the location/ZIP page and submit
+    // Try Playwright click+type first (most reliable), fall back to evaluate
+    const zipSel = 'input[placeholder*="ZIP" i], input[placeholder*="zip" i], input[aria-label*="zip" i], input[id*="zip" i], input[name*="zip" i]';
+    const zipLocator = page.locator(zipSel).first();
+    if (await zipLocator.count() > 0) {
+      await zipLocator.click({ timeout: 5000 }).catch(() => {});
+      await zipLocator.fill(zip, { timeout: 5000 }).catch(() => {});
+      console.log(`[UHC] ZIP entered via locator`);
     } else {
-      // Original working URL for specialty/category search
-      await page.goto(
-        `https://findcare.guest.uhc.com/find-care?plan=s00001&zip=${encodeURIComponent(zip)}`,
-        { waitUntil: 'domcontentloaded', timeout: 40000 }
-      ).catch(() => {});
-      await page.waitForTimeout(3000);
-      console.log(`[UHC] Specialty search — find-care nav: ${page.url()}`);
+      // Fallback: first visible text input
+      await page.evaluate((z) => {
+        const el = Array.from(document.querySelectorAll('input'))
+          .find(i => i.offsetParent !== null && i.type !== 'hidden' && i.type !== 'checkbox' && i.type !== 'radio');
+        if (!el) return;
+        el.value = z;
+        el.dispatchEvent(new Event('input',  { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+      }, zip);
+      console.log(`[UHC] ZIP entered via evaluate fallback`);
     }
+    await page.waitForTimeout(600);
+
+    // Click the Search/Continue button on the ZIP page
+    await page.evaluate(() => {
+      const btn = Array.from(document.querySelectorAll('button, input[type="submit"]')).find(b =>
+        b.offsetParent !== null && /search|continue|submit|find|go/i.test(b.textContent || b.value || '')
+      );
+      if (btn) btn.click();
+    });
+    await page.waitForTimeout(3000);
+    console.log(`[UHC] After ZIP submit: ${page.url()}`);
 
     // Step 3: Dismiss any modal
     await page.evaluate(() => {

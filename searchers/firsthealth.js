@@ -3,7 +3,24 @@
  * 3-step flow: network select → provider type → search form → scrape results
  */
 
+const https    = require('https');
 const { chromium } = require('playwright');
+
+// Geocode ZIP → state abbreviation (needed for #SearchState Required field)
+function zipToState(zip) {
+  return new Promise((resolve) => {
+    https.get(`https://api.zippopotam.us/us/${zip}`, res => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => {
+        try {
+          const place = JSON.parse(data).places?.[0];
+          resolve(place ? place['state abbreviation'] : null);
+        } catch { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+  });
+}
 
 async function jsfill(page, selector, value) {
   await page.evaluate(([sel, val]) => {
@@ -26,6 +43,9 @@ async function waitForUrlContains(page, fragment, timeout = 20000) {
 }
 
 module.exports = async function firsthealthSearch({ zip, name, specialty, npi } = {}) {
+  // Resolve state from ZIP (needed for the Required #SearchState dropdown)
+  const stateCode = zip ? await zipToState(zip.trim()) : null;
+  console.log(`[FH] ZIP ${zip} → state: ${stateCode}`);
   const browser = await chromium.launch({
     headless: true,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
@@ -104,7 +124,26 @@ module.exports = async function firsthealthSearch({ zip, name, specialty, npi } 
     // IMPORTANT: ZIP must be entered FIRST — the #specialities dropdown is
     // empty on page load and is AJAX-populated only after ZIP is entered.
 
-    // 3a. Enter ZIP (triggers AJAX to populate #specialities and county/city)
+    // 3a. Set state dropdown first (#SearchState is marked Required)
+    if (stateCode) {
+      await page.evaluate((sc) => {
+        const sel = document.querySelector('#SearchState');
+        if (!sel) return;
+        // Find option matching state abbreviation (value or text)
+        const opt = Array.from(sel.options).find(o =>
+          o.value.toUpperCase() === sc.toUpperCase() ||
+          o.text.trim().toUpperCase() === sc.toUpperCase()
+        );
+        if (opt) {
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      }, stateCode);
+      await page.waitForTimeout(800);
+      console.log(`[FH] State set to ${stateCode}`);
+    }
+
+    // 3b. Enter ZIP via JS (bypasses visibility) — single clean entry
     if (zip && zip.trim()) {
       await page.evaluate((z) => {
         const el = document.querySelector('#txtboxZipCode');
@@ -114,26 +153,31 @@ module.exports = async function firsthealthSearch({ zip, name, specialty, npi } 
         el.dispatchEvent(new Event('change', { bubbles: true }));
         el.dispatchEvent(new Event('blur',   { bubbles: true }));
       }, zip.trim());
-      // Also try slow-type into the field as a fallback trigger
-      await page.click('#txtboxZipCode', { clickCount: 3 }).catch(() => {});
+      await page.waitForTimeout(400);
+
+      // Also slow-type to trigger any keydown/keyup handlers
+      await page.evaluate(() => {
+        const el = document.querySelector('#txtboxZipCode');
+        if (el) el.select?.();
+      });
       await page.keyboard.type(zip.trim(), { delay: 60 }).catch(() => {});
       await page.dispatchEvent('#txtboxZipCode', 'change').catch(() => {});
       await page.dispatchEvent('#txtboxZipCode', 'blur').catch(() => {});
 
-      // Wait for #specialities to be populated (AJAX-driven)
+      // Poll for #specialities to populate (AJAX triggered by ZIP + state)
       const specialtiesLoaded = await page.evaluate(() => {
         return new Promise(resolve => {
           let tries = 0;
           const poll = setInterval(() => {
             const sel = document.querySelector('#specialities');
-            if ((sel && sel.options.length > 1) || tries++ > 30) {
+            if ((sel && sel.options.length > 1) || tries++ > 40) {
               clearInterval(poll);
               resolve(sel ? sel.options.length : 0);
             }
           }, 300);
         });
       });
-      console.log(`[FH] #specialities options after ZIP: ${specialtiesLoaded}`);
+      console.log(`[FH] #specialities options after ZIP+state: ${specialtiesLoaded}`);
       await page.waitForTimeout(500);
     }
 
