@@ -69,19 +69,23 @@ module.exports = async function firsthealthSearch({ zip, name, specialty, npi } 
     await page.waitForTimeout(1500);
 
     // ── STEP 2: Provider type = Physician ─────────────────────────────────
-    const physicianLabel = page.locator('div#Physician label.btn').first();
-    if (await physicianLabel.count() > 0) {
-      await physicianLabel.click();
-    } else {
-      await page.locator('label:has-text("Physician")').first().click().catch(() => {});
-    }
-    await page.waitForTimeout(500);
-
     await page.evaluate(() => {
-      const cb = document.querySelector('#AcceptingNewPatients');
+      // Click the Physician radio button (works with both styled and plain radio inputs)
+      const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+      const physician = radios.find(r => {
+        const label = document.querySelector(`label[for="${r.id}"]`);
+        return label && /physician/i.test(label.textContent);
+      }) || radios.find(r => /physician/i.test(r.value || ''));
+      if (physician) {
+        physician.checked = true;
+        physician.click();
+        physician.dispatchEvent(new Event('change', { bubbles: true }));
+      }
+      // Check "Accepting new patients" if present
+      const cb = document.querySelector('#AcceptingNewPatients, input[id*="ccepting"], input[name*="ccepting"]');
       if (cb && !cb.checked) cb.click();
     });
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(600);
 
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {}),
