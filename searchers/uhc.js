@@ -1,11 +1,44 @@
 // searchers/uhc.js
-// UHC Choice Plus provider search via GraphQL request interception + ZIP patching
+// UHC Choice Plus provider search — patches lat/lon from ZIP in GraphQL request
 
+const https = require('https');
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
 
+// Convert ZIP to lat/lon using free zippopotam.us API (no key required)
+function zipToLatLon(zip) {
+  return new Promise((resolve, reject) => {
+    https.get(`https://api.zippopotam.us/us/${zip}`, res => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          const place = json.places?.[0];
+          if (!place) return reject(new Error(`ZIP ${zip} not found`));
+          resolve({
+            latitude: place.latitude,
+            longitude: place.longitude,
+            stateCode: place['state abbreviation'],
+          });
+        } catch (e) { reject(e); }
+      });
+    }).on('error', reject);
+  });
+}
+
 async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults = 50 } = {}) {
+  // Resolve ZIP → lat/lon before launching browser
+  let geoData;
+  try {
+    geoData = await zipToLatLon(zip);
+    console.log(`[UHC] ZIP ${zip} → lat:${geoData.latitude} lon:${geoData.longitude} state:${geoData.stateCode}`);
+  } catch (e) {
+    console.warn(`[UHC] Geocode failed for ${zip}: ${e.message} — proceeding without patch`);
+    geoData = null;
+  }
+
   const browser = await chromium.launch({
     headless: true,
     args: [
@@ -31,40 +64,40 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
 
     const providerBatches = [];
 
-    // Intercept outgoing GraphQL ProviderSearch requests and patch the ZIP
+    // Intercept GraphQL ProviderSearch requests and patch lat/lon/state to match requested ZIP
     await page.route('**graphql**', async route => {
       const request = route.request();
-      const url = request.url();
-
-      if (!url.includes('ProviderSearch')) {
+      if (!request.url().includes('ProviderSearch') || !geoData) {
         return route.continue();
       }
 
       try {
         const body = request.postDataJSON();
-        console.log('[UHC] GraphQL vars:', JSON.stringify(body?.variables));
-
-        // Recursively patch any zip/postal/location fields in variables
-        const patchZip = (obj) => {
-          if (!obj || typeof obj !== 'object') return;
-          for (const key of Object.keys(obj)) {
-            const lk = key.toLowerCase();
-            if (typeof obj[key] === 'string' && /zip|postal|zipcode/i.test(lk)) {
-              console.log(`[UHC] Patching ${key}: ${obj[key]} → ${zip}`);
-              obj[key] = zip;
-            } else if (typeof obj[key] === 'object') {
-              patchZip(obj[key]);
-            }
-          }
-        };
 
         if (body?.variables) {
-          patchZip(body.variables);
+          const v = body.variables;
+          // Patch location fields
+          if (v.latitude !== undefined)  v.latitude  = geoData.latitude;
+          if (v.longitude !== undefined) v.longitude = geoData.longitude;
+          if (v.stateCode !== undefined) v.stateCode = geoData.stateCode;
+          // Patch nested searchLocation if present
+          if (v.searchLocation) {
+            v.searchLocation.latitude  = geoData.latitude;
+            v.searchLocation.longitude = geoData.longitude;
+          }
+          // Patch uniqueSearch (contains old coords)
+          if (typeof v.uniqueSearch === 'string') {
+            v.uniqueSearch = v.uniqueSearch.replace(
+              /suggestion-[\d.-]+-[\d.-]+/,
+              `suggestion-${geoData.latitude}-${geoData.longitude}`
+            );
+          }
+          console.log(`[UHC] Patched lat/lon → ${geoData.latitude}, ${geoData.longitude}`);
         }
 
         await route.continue({ postData: JSON.stringify(body) });
       } catch (e) {
-        console.log('[UHC] Route error:', e.message);
+        console.log('[UHC] Route patch error:', e.message);
         route.continue();
       }
     });
@@ -83,7 +116,7 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
       }
     });
 
-    // Step 1: Establish guest session first (short timeout, ignore errors)
+    // Step 1: Establish guest session
     try {
       await page.goto('https://findcare.guest.uhc.com/guest-plan-selection/', {
         waitUntil: 'domcontentloaded', timeout: 20000,
@@ -91,13 +124,11 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
       await page.waitForTimeout(2000);
     } catch {}
 
-    // Step 2: Navigate to find-care with plan + zip
+    // Step 2: Navigate to find-care with zip
     await page.goto(
       `https://findcare.guest.uhc.com/find-care?plan=s00001&zip=${encodeURIComponent(zip)}`,
       { waitUntil: 'domcontentloaded', timeout: 40000 }
     );
-
-    // Wait for React SPA to hydrate
     await page.waitForTimeout(4000);
 
     // Step 3: Dismiss any modal
@@ -121,10 +152,9 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
     });
     await page.waitForTimeout(1000);
 
-    // Step 4: Wait for combobox with longer timeout
+    // Step 4: Wait for specialty input
     await page.waitForSelector('input[role="combobox"]', { timeout: 20000 }).catch(() => {});
 
-    // Try to find specialty input — check all comboboxes
     const allComboboxes = await page.locator('input[role="combobox"]').all();
     let searchInput = null;
 
@@ -138,7 +168,6 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
       break;
     }
 
-    // Fallback: any visible input that looks like a search box
     if (!searchInput) {
       const inputs = await page.locator('input[type="text"], input:not([type])').all();
       for (const inp of inputs) {
@@ -178,7 +207,6 @@ async function searchUHC({ specialty = 'Cardiologist', zip = '77041', maxResults
     }
     await page.waitForTimeout(300);
 
-    // Click Search button if present
     await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find(b =>
         b.textContent?.trim().toLowerCase() === 'search' && b.offsetParent !== null
