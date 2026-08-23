@@ -100,8 +100,33 @@
             style="width:100%;padding:9px 12px;border:1px solid #e0e3eb;border-radius:8px;font-size:14px;background:#fff;color:#1a1a2e;outline:none;font-family:inherit;box-sizing:border-box">
         </div>
       </div>
-      <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:10px 12px;font-size:12px;color:#92400e;margin-bottom:14px;line-height:1.5">
-        ⓘ Name search checks UHC Choice Plus first — the largest of the four networks. Results show which plans include this provider near your ZIP.
+      <!-- Network pills for name search -->
+      <div style="margin-bottom:16px">
+        <div style="font-size:12px;color:#6b7280;font-weight:600;margin-bottom:10px;text-transform:uppercase;letter-spacing:.04em">
+          Search within network — tap to select
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap" id="pvNameNetSel">
+          <label class="pvpill pvnamepill" data-net="uhc" data-color="#1a2f6b" data-bg="#EEF2FF"
+            style="border-color:#1a2f6b;background:#EEF2FF;color:#1a2f6b;font-weight:700;padding:10px 20px;font-size:14px;border-width:2px;border-radius:10px">
+            <input type="checkbox" class="pvnamenet" value="uhc" checked style="display:none">
+            <span class="pvnamechk" style="font-size:15px">✓ </span>UHC PPO
+          </label>
+          <label class="pvpill pvnamepill" data-net="aetna" data-color="#7B2D8B" data-bg="#F5F3FF"
+            style="padding:10px 20px;font-size:14px;border-width:2px;border-radius:10px">
+            <input type="checkbox" class="pvnamenet" value="aetna" style="display:none">
+            <span class="pvnamechk" style="display:none;font-size:15px">✓ </span>Aetna PPO
+          </label>
+          <label class="pvpill pvnamepill" data-net="phcs" data-color="#1D9E75" data-bg="#ECFDF5"
+            style="padding:10px 20px;font-size:14px;border-width:2px;border-radius:10px">
+            <input type="checkbox" class="pvnamenet" value="phcs" style="display:none">
+            <span class="pvnamechk" style="display:none;font-size:15px">✓ </span>PHCS PPO
+          </label>
+          <label class="pvpill pvnamepill" data-net="fh" data-color="#B86B0A" data-bg="#FFF7ED"
+            style="padding:10px 20px;font-size:14px;border-width:2px;border-radius:10px">
+            <input type="checkbox" class="pvnamenet" value="fh" style="display:none">
+            <span class="pvnamechk" style="display:none;font-size:15px">✓ </span>First Health PPO
+          </label>
+        </div>
       </div>
       <button onclick="pvSearch('name')"
         style="width:100%;padding:12px;background:#1a2f6b;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;transition:background .15s"
@@ -241,11 +266,19 @@ pvDrNameInp.addEventListener('input', function() {
   clearTimeout(pvDrTimer);
   var q = pvDrNameInp.value.trim();
   if (q.length < 2) { pvDrDrp.style.display = 'none'; return; }
+  // Require ZIP before showing suggestions
+  var zip = document.getElementById('pvDrZip').value.trim();
+  if (zip.length < 5) {
+    pvDrDrp.innerHTML = '<div style="padding:10px 14px;font-size:12px;color:#b45309;background:#fffbeb;display:flex;align-items:center;gap:7px">'
+      + '<span style="font-size:15px">📍</span>'
+      + '<span>Please enter your <strong>ZIP code</strong> first so we can find providers near you.</span></div>';
+    pvDrDrp.style.display = 'block';
+    return;
+  }
   // Show loading placeholder
   pvDrDrp.innerHTML = '<div style="padding:10px 14px;font-size:12px;color:#9ca3af">Searching providers…</div>';
   pvDrDrp.style.display = 'block';
   pvDrTimer = setTimeout(function() {
-    var zip = document.getElementById('pvDrZip').value.trim() || '77041';
     if (pvDrCtrl) pvDrCtrl.abort();
     pvDrCtrl = new AbortController();
     fetch(PV_API + '/api/suggest?name=' + encodeURIComponent(q) + '&zip=' + encodeURIComponent(zip),
@@ -262,21 +295,24 @@ document.addEventListener('click', function(e) {
   }
 });
 
-// ── NETWORK PILL TOGGLES ───────────────────────────────────────────────────
+// ── NETWORK PILL TOGGLES (both tabs) ──────────────────────────────────────
 document.querySelectorAll('.pvpill').forEach(function(lbl) {
   lbl.addEventListener('click', function() {
     setTimeout(function() {
-      var cb = lbl.querySelector('input');
+      var cb  = lbl.querySelector('input');
+      var chk = lbl.querySelector('.pvnamechk');
       if (cb.checked) {
         lbl.style.borderColor = lbl.dataset.color;
         lbl.style.background  = lbl.dataset.bg;
         lbl.style.color       = lbl.dataset.color;
-        lbl.style.fontWeight  = '600';
+        lbl.style.fontWeight  = '700';
+        if (chk) chk.style.display = '';
       } else {
         lbl.style.borderColor = '#e0e3eb';
         lbl.style.background  = '#fff';
         lbl.style.color       = '#6b7280';
         lbl.style.fontWeight  = '500';
+        if (chk) chk.style.display = 'none';
       }
     }, 0);
   });
@@ -299,9 +335,10 @@ window.pvSearch = async function(mode) {
   } else {
     var drName = document.getElementById('pvDrName').value.trim();
     zip       = document.getElementById('pvDrZip').value.trim();
-    networks  = ['uhc']; // name search uses UHC's free-text search
+    networks  = Array.from(document.querySelectorAll('.pvnamenet:checked')).map(function(c) { return c.value; });
     if (!drName)          { var ni=document.getElementById('pvDrName'); ni.style.borderColor='#f87171'; ni.focus(); return; }
     if (zip.length < 5)   { var dzi=document.getElementById('pvDrZip'); dzi.style.borderColor='#f87171'; dzi.focus(); return; }
+    if (!networks.length) { alert('Select at least one network.'); return; }
   }
 
   // Loading
