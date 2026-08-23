@@ -114,6 +114,7 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
     // Collect all GraphQL responses that contain providers (ProviderSearch OR name search queries)
     page.on('response', async res => {
       const url = res.url();
+      if (url.includes('graphql')) console.log(`[UHC] GraphQL hit: ${url.substring(0, 120)}`);
       if (!url.includes('findcare.guest.uhc.com/api/graphql')) return;
       try {
         const body = await res.json();
@@ -202,6 +203,9 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
     if (!searchInput) {
       throw new Error('UHC: could not find search input');
     }
+    const inputPh = await searchInput.getAttribute('placeholder').catch(() => '') || '';
+    const inputAl = await searchInput.getAttribute('aria-label').catch(() => '') || '';
+    console.log(`[UHC] Search input found — placeholder:"${inputPh}" aria:"${inputAl}"`);
 
     // Step 5: Type search term and wait for GraphQL response
     const searchDone = new Promise(resolve => {
@@ -220,6 +224,7 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
     // Step 6: Handle autocomplete dropdown
     await page.waitForSelector('[role="option"]', { timeout: 8000 }).catch(() => {});
     const options = await page.locator('[role="option"]').all();
+    console.log(`[UHC] Autocomplete options found: ${options.length}`);
 
     let clicked = false;
     if (options.length > 0) {
@@ -278,13 +283,15 @@ async function searchUHC({ specialty, name, zip = '77041', maxResults = 50 } = {
 
     await page.waitForTimeout(500);
 
-    // Step 6: Click Search button if present
-    await page.evaluate(() => {
+    // Step 7: Click Search button if present
+    const searchBtnFound = await page.evaluate(() => {
       const btn = Array.from(document.querySelectorAll('button')).find(b =>
         b.textContent?.trim().toLowerCase() === 'search' && b.offsetParent !== null
       );
-      if (btn) btn.click();
+      if (btn) { btn.click(); return true; }
+      return false;
     });
+    console.log(`[UHC] Search button clicked: ${searchBtnFound}`);
 
     await searchDone;
     await page.waitForTimeout(2000);
