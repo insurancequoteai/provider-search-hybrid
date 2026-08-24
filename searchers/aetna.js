@@ -125,9 +125,15 @@ async function searchViaAngular(name, zip, maxResults) {
     _h.page.on('response', handler);
   });
 
+  // Extract the x-ibm-client-id from captured headers — we'll pass it explicitly
+  // since Angular's interceptor doesn't add it for direct $http.get() calls.
+  const clientId = _h.reqHeaders?.['x-ibm-client-id'] || '';
+  console.log('[Aetna] x-ibm-client-id present:', !!clientId);
+
   // Inject $http.get() call via Angular's own HTTP service.
-  // This runs inside the browser — session cookies + interceptors apply automatically.
-  const injected = await _h.page.evaluate(([searchText, postalCode, pipeName]) => {
+  // Runs inside the browser (not blocked by WAF). We add the client-id explicitly
+  // since the Angular interceptor only adds it for requests from UI controllers.
+  const injected = await _h.page.evaluate(([searchText, postalCode, pipeName, clientId]) => {
     try {
       const el = document.querySelector('[ng-app],[data-ng-app],.ng-scope,[ng-controller]');
       if (!el) return { error: 'no Angular root element' };
@@ -136,26 +142,9 @@ async function searchViaAngular(name, zip, maxResults) {
       const $http = inj.get('$http');
       if (!$http) return { error: 'no $http service' };
 
-      // Try AngularJS scope search function first (most natural path)
-      try {
-        const sc = window.angular.element(el).scope();
-        if (sc) {
-          // Set the typeahead value and trigger search like the UI does
-          sc.$apply(() => {
-            if (sc.criteria) sc.criteria.typeAheadSearch = searchText;
-          });
-          // Look for search/submit function on scope chain
-          for (const fn of ['search', 'doSearch', 'searchProviders', 'submit', 'onSearch']) {
-            if (typeof sc[fn] === 'function') {
-              sc[fn]();
-              return { method: 'scope.' + fn };
-            }
-          }
-        }
-      } catch(e) { /* ignore — fall through to $http */ }
-
-      // Direct $http.get() — goes through Angular interceptors (auth headers added automatically)
+      // Direct $http.get() with explicit auth header — goes through browser networking stack
       $http.get('https://api01.aetna.com/healthcore/prod/v3/publicdse_providersearch', {
+        headers: clientId ? { 'x-ibm-client-id': clientId } : {},
         params: {
           searchText,
           pipeName,
@@ -169,11 +158,11 @@ async function searchViaAngular(name, zip, maxResults) {
           pageNum: '1',
         },
       });
-      return { method: '$http.get' };
+      return { method: '$http.get', hasClientId: !!clientId };
     } catch(e) {
       return { error: e.message };
     }
-  }, [searchText, zip || '77041', 'Open Choice PPO']);
+  }, [searchText, zip || '77041', 'Open Choice PPO', clientId]);
 
   console.log('[Aetna] Angular inject result:', JSON.stringify(injected));
   if (injected?.error) throw new Error('Angular inject failed: ' + injected.error);
