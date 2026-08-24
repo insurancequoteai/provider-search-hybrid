@@ -203,34 +203,94 @@ async function initWarmPage(zip) {
     return route.continue();
   });
 
-  // ★ THE KEY: capture URL template + ALL auth headers from the real browser request
+  // Capture auth headers from ANY api01.aetna.com/healthcore request
+  // (auth token is the same for typeahead and providersearch endpoints)
   page.on('request', req => {
-    if (req.url().includes('publicdse_providersearch')) {
-      _h.urlTemplate = req.url();
-      _h.reqHeaders  = req.headers();
-      console.log('[Aetna] ✓ Auth headers captured! URL:', req.url().substring(0, 200));
+    const url = req.url();
+    if (!url.includes('api01.aetna.com') && !url.includes('healthcore')) return;
+    const hdrs = req.headers();
+    console.log('[Aetna] API request:', url.substring(0, 200), '| auth keys:', Object.keys(hdrs).filter(k => /auth|ibm|key|token|secret/i.test(k)).join(','));
+    if (!_h.reqHeaders) {
+      _h.reqHeaders = hdrs;
+      console.log('[Aetna] ✓ Auth headers captured from:', url.substring(0, 120));
+    }
+    if (url.includes('publicdse_providersearch') && !_h.urlTemplate) {
+      _h.urlTemplate = url;
+      _h.reqHeaders  = hdrs;
+      console.log('[Aetna] ✓ Search URL template captured');
     }
   });
 
   await navigateToSearch(page, zip);
 
-  // Type 3+ characters — AngularJS requires at least 3 chars before it fires the API
-  // page.on('request') above captures the URL + auth headers from that call
-  const inp = page.locator('#Doctors, input[ng-model="criteria.typeAheadSearch"]').first();
-  if (await inp.count() > 0) {
-    await inp.click();
-    await page.keyboard.type('smith', { delay: 50 });
-    // Wait for the API request to fire (AngularJS debounce ~300ms + network)
-    await page.waitForResponse(
-      r => r.url().includes('publicdse_providersearch'),
-      { timeout: 8000 }
-    ).catch(() => {});
-    await page.waitForTimeout(500);
+  // Strategy 1: extract auth headers directly from AngularJS $http service
+  // (AngularJS sets auth in $http.defaults.headers.common at app startup — no API call needed)
+  const ngHeaders = await page.evaluate(() => {
+    try {
+      const el = document.querySelector('[ng-app], [data-ng-app], .ng-scope');
+      if (!el) return null;
+      const injector = window.angular?.element(el)?.injector();
+      if (!injector) return null;
+      const $http = injector.get('$http');
+      const common = ($http?.defaults?.headers?.common) || {};
+      // Also look inside registered interceptors for auth
+      return Object.keys(common).length > 0 ? common : null;
+    } catch (e) {
+      return { __error: e.message };
+    }
+  });
+  console.log('[Aetna] AngularJS $http headers:', JSON.stringify(ngHeaders));
+
+  // Strategy 2: type 3+ chars into typeahead to trigger the API, capture via page.on('request')
+  if (!_h.reqHeaders) {
+    const inp = page.locator('#Doctors, input[ng-model="criteria.typeAheadSearch"]').first();
+    if (await inp.count() > 0) {
+      try {
+        // Focus via JS, then dispatch events the way a real browser would
+        await page.evaluate(() => {
+          const el = document.querySelector('#Doctors, input[ng-model="criteria.typeAheadSearch"]');
+          if (el) { el.focus(); el.click(); }
+        });
+        await page.waitForTimeout(300);
+        // Type using fill() + input events — more reliable than keyboard.type in headless
+        await inp.fill('smith');
+        await page.evaluate(() => {
+          const el = document.querySelector('#Doctors, input[ng-model="criteria.typeAheadSearch"]');
+          if (!el) return;
+          ['input', 'change', 'keyup'].forEach(t =>
+            el.dispatchEvent(new Event(t, { bubbles: true }))
+          );
+          // Also trigger AngularJS's own digest
+          try {
+            const sc = window.angular?.element(el)?.scope();
+            sc?.criteria && (sc.criteria.typeAheadSearch = 'smith');
+            sc?.$apply?.();
+          } catch {}
+        });
+        // Wait up to 10s for any publicdse_providersearch request
+        await page.waitForResponse(
+          r => r.url().includes('publicdse_providersearch'),
+          { timeout: 10000 }
+        ).catch(() => {});
+        await page.waitForTimeout(500);
+      } catch (e) {
+        console.log('[Aetna] Typeahead trigger error:', e.message);
+      }
+    }
+  }
+
+  // If we got AngularJS headers but still need the URL template, we'll capture it
+  // on the first real API call (fast path will trigger it via the cached headers approach)
+  if (ngHeaders && !ngHeaders.__error && Object.keys(ngHeaders).length > 0 && !_h.reqHeaders) {
+    // We have auth headers from AngularJS but no URL template yet
+    // Store the headers; the URL template will be set when the first real request fires
+    console.log('[Aetna] Got AngularJS headers (no URL template yet, will capture on first request)');
+    _h.reqHeaders = ngHeaders; // partial — URL template still needed
   }
 
   _h.page = page;
   _h.zip  = zip;
-  console.log(`[Aetna] Warm ready in ${Date.now() - t0}ms | headers: ${_h.reqHeaders ? 'captured ✓' : 'MISSING ✗'}`);
+  console.log(`[Aetna] Warm ready in ${Date.now() - t0}ms | headers: ${_h.reqHeaders ? 'captured ✓' : 'MISSING ✗'} | url: ${_h.urlTemplate ? 'captured ✓' : 'MISSING ✗'}`);
   return page;
 }
 
@@ -312,18 +372,23 @@ async function searchAetnaFreshBrowserTypeahead(name, zip, maxResults) {
       return route.continue();
     });
 
-    // Capture headers from this fresh browser too
+    // Capture headers from ANY api01.aetna.com request (typeahead or search)
     page.on('request', req => {
-      if (req.url().includes('publicdse_providersearch')) {
-        _h.urlTemplate = req.url();
-        _h.reqHeaders  = req.headers();
-        console.log('[Aetna] ✓ Auth headers captured (fresh browser)');
+      const url = req.url();
+      if (!url.includes('api01.aetna.com') && !url.includes('healthcore')) return;
+      const hdrs = req.headers();
+      console.log('[Aetna] Fresh browser API req:', url.substring(0, 150), '| auth keys:', Object.keys(hdrs).filter(k => /auth|ibm|key|token|secret/i.test(k)).join(','));
+      if (!_h.reqHeaders) { _h.reqHeaders = hdrs; }
+      if (url.includes('publicdse_providersearch') && !_h.urlTemplate) {
+        _h.urlTemplate = url; _h.reqHeaders = hdrs;
+        console.log('[Aetna] ✓ Search URL template captured (fresh browser)');
       }
     });
 
     let capturedBody = null;
     page.on('response', async res => {
-      if (res.url().includes('publicdse_providersearch'))
+      const url = res.url();
+      if (url.includes('publicdse_providersearch') || url.includes('api01.aetna.com'))
         try { capturedBody = await res.text(); } catch {}
     });
 
@@ -337,9 +402,9 @@ async function searchAetnaFreshBrowserTypeahead(name, zip, maxResults) {
     const typeQuery = name.length >= 3 ? name : name + 'aa';
     await page.keyboard.type(typeQuery, { delay: 30 });
 
-    // Wait for ANY API response (typeahead results)
+    // Wait for ANY api01.aetna.com response (typeahead or search)
     const resp = await page.waitForResponse(
-      r => r.url().includes('publicdse_providersearch'),
+      r => r.url().includes('api01.aetna.com') || r.url().includes('healthcore'),
       { timeout: 15000 }
     ).catch(() => null);
 
