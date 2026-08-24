@@ -88,34 +88,62 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
 
     if (isNameSearch) {
       // ── Name search ───────────────────────────────────────────────────────────
-      // The providerSearch page already has a typeahead input (id="Doctors",
-      // ng-model="criteria.typeAheadSearch"). Type the name there and submit.
-      await page.waitForTimeout(1200);
+      // The main providerSearch typeahead doesn't fire publicdse_providersearch.
+      // We must enter a category (Medical Doctors) first, then use the name input
+      // on that page which does fire the provider search API.
+      await page.waitForTimeout(1000);
 
+      // Step 1: Click "Medical Doctors & Specialists" tile
+      const medClicked = await page.evaluate(() => {
+        const el = Array.from(document.querySelectorAll('a, button, li, span, div'))
+          .find(el => el.offsetParent !== null &&
+            /Medical Doctors/i.test(el.textContent || ''));
+        if (el) { el.click(); return el.textContent?.trim().substring(0, 60); }
+        return null;
+      });
+      console.log(`[Aetna] Med Doctors tile: ${medClicked}`);
+      await page.waitForURL('**/providerMedical**', { timeout: 15000 }).catch(() => {});
+      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      await page.waitForTimeout(800);
+
+      // DEBUG: see what inputs are on the Medical page
+      const medInputs = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('input'))
+          .filter(el => el.offsetParent !== null)
+          .map(el => ({ type: el.type, placeholder: el.placeholder,
+            ngModel: el.getAttribute('ng-model'), id: el.id, ariaLabel: el.getAttribute('aria-label') }))
+      );
+      console.log('[Aetna] Med page inputs:', JSON.stringify(medInputs));
+
+      // Step 2: Set up response capture BEFORE submitting
       const responsePromise = page.waitForResponse(
         res => res.url().includes('publicdse_providersearch'),
-        { timeout: 30000 }
+        { timeout: 35000 }
       ).catch(() => null);
 
-      // Type name into the main search box
+      // Step 3: Find and fill the name/keyword input on this page
       const nameInputFound = await page.evaluate((providerName) => {
-        const inp = document.getElementById('Doctors') ||
-          document.querySelector('input[ng-model="criteria.typeAheadSearch"]') ||
-          Array.from(document.querySelectorAll('input[type="text"], input:not([type])'))
-            .find(el => el.offsetParent !== null);
+        const inputs = Array.from(document.querySelectorAll('input[type="text"], input:not([type])'))
+          .filter(el => el.offsetParent !== null);
+        const inp = inputs.find(el =>
+          /name|provider|doctor|keyword|search/i.test(el.placeholder || '') ||
+          /name|provider|doctor|keyword/i.test(el.getAttribute('ng-model') || '') ||
+          /name|provider|doctor/i.test(el.getAttribute('aria-label') || '')
+        ) || inputs[0];
         if (!inp) return null;
         inp.value = providerName;
         inp.dispatchEvent(new Event('input',  { bubbles: true }));
         inp.dispatchEvent(new Event('change', { bubbles: true }));
         inp.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-        return inp.id || inp.getAttribute('ng-model') || 'found';
+        return inp.id || inp.getAttribute('ng-model') || inp.placeholder || 'found';
       }, name);
-      console.log(`[Aetna] Name input: ${nameInputFound}`);
+      console.log(`[Aetna] Med page name input: ${nameInputFound}`);
 
-      if (!nameInputFound) throw new Error('Aetna: could not find provider name input');
+      if (!nameInputFound) throw new Error('Aetna: could not find name input on Medical page');
 
-      await page.waitForTimeout(500);
-      // Click the Search button
+      await page.waitForTimeout(600);
+
+      // Step 4: Click Search or press Enter
       const searchClicked = await page.evaluate(() => {
         const btn = Array.from(document.querySelectorAll('button, input[type="submit"]'))
           .find(el => el.offsetParent !== null &&
