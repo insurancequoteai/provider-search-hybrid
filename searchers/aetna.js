@@ -163,33 +163,50 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
         } catch(e) { console.log('[Aetna] parseBody error:', e.message); return []; }
       };
 
-      // ── Main search: expand full list then click "(any location)" ───────────────
+      // ── Main search: expand full list then iterate all suggestions ──────────────
       await typeAndGetSuggestions(); // type and wait for dropdown to appear
       const cap = Math.min(maxResults, 8);
 
-      // Step A: click "X more Healthcare Providers & Practices »" to expand full dropdown
+      // Step A: click the AngularJS "viewMore" link to expand full suggestion list
+      // The link lives in <div class="viewMore"><a ng-click="clickViewMore(...)">
       const moreClicked = await page.evaluate(() => {
-        const el = Array.from(document.querySelectorAll('li, a, div, span, button'))
-          .find(el => el.offsetParent !== null && /\d+\s+more\s+Healthcare\s+Providers/i.test(el.textContent || ''));
-        if (el) { el.click(); return el.textContent?.trim(); }
+        // Prefer the exact CSS class used by Aetna's AngularJS template
+        const byClass = document.querySelector('.viewMore a');
+        if (byClass && byClass.offsetParent !== null) {
+          byClass.click();
+          return byClass.textContent?.trim();
+        }
+        // Fallback: any visible <a> whose ng-click calls clickViewMore
+        const byAttr = Array.from(document.querySelectorAll('a[ng-click*="clickViewMore"]'))
+          .find(el => el.offsetParent !== null);
+        if (byAttr) { byAttr.click(); return byAttr.textContent?.trim(); }
         return null;
       });
       console.log(`[Aetna] "More providers" link: ${moreClicked}`);
       if (moreClicked) {
-        await page.waitForTimeout(1200); // let expanded list render
+        await page.waitForTimeout(1400); // let expanded list render
       }
 
+      // Step B: try clicking "{name} (any location)" for a single broad-radius call
       const respPromise = page.waitForResponse(
         res => res.url().includes('publicdse_providersearch'),
         { timeout: 35000 }
       ).catch(() => null);
 
-      // Step B: click "{name} (any location)" from the (now expanded) dropdown
       const anyLocationClicked = await page.evaluate((searchName) => {
         const pattern = new RegExp(searchName.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '\\s*\\(any location\\)', 'i');
-        const el = Array.from(document.querySelectorAll('li, a, div, span, button'))
-          .find(el => el.offsetParent !== null && pattern.test(el.textContent || ''));
+        // Check typeahead_grouping li items (Aetna's AngularJS rendered suggestion rows)
+        const candidates = [
+          ...document.querySelectorAll('li.typeahead_grouping'),
+          ...document.querySelectorAll('li[ng-repeat*="Filter"]'),
+          ...document.querySelectorAll('.dropdown-menu li'),
+        ];
+        const el = candidates.find(el => el.offsetParent !== null && pattern.test(el.textContent || ''));
         if (el) { el.click(); return el.textContent?.trim(); }
+        // Broader fallback
+        const anyEl = Array.from(document.querySelectorAll('li, a, span, div'))
+          .find(el => el.offsetParent !== null && pattern.test(el.textContent || ''));
+        if (anyEl) { anyEl.click(); return anyEl.textContent?.trim(); }
         return null;
       }, name);
       console.log(`[Aetna] Any-location option: ${anyLocationClicked}`);
@@ -214,36 +231,42 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
         return result.slice(0, cap);
 
       } else {
-        // Fallback: iterate individual suggestions
-        console.log('[Aetna] No any-location option found, iterating suggestions');
-        const suggestions = await page.evaluate(() =>
-          Array.from(document.querySelectorAll('li[ng-repeat], .dropdown-menu li, ul.typeahead li'))
-            .filter(el => el.offsetParent !== null && / - .+, [A-Z]{2}/.test(el.textContent || ''))
-            .map(el => el.textContent?.trim())
+        // Fallback: iterate individual typeahead suggestion items
+        // Use AngularJS class "typeahead_grouping" which is the actual rendered row class
+        console.log('[Aetna] No any-location found, iterating typeahead_grouping suggestions');
+        const suggCount = await page.evaluate(() =>
+          Array.from(document.querySelectorAll('li.typeahead_grouping, li[ng-repeat*="specFilter"], li[ng-repeat*="hospFilter"]'))
+            .filter(el => el.offsetParent !== null).length
         );
-        console.log(`[Aetna] Suggestions: ${JSON.stringify(suggestions)}`);
+        console.log(`[Aetna] Visible suggestion items: ${suggCount}`);
 
         const allProviders = [];
         const seenKeys = new Set();
 
-        for (let i = 0; i < suggestions.length && allProviders.length < cap; i++) {
+        for (let i = 0; i < suggCount && allProviders.length < cap; i++) {
           if (i > 0) {
             await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
             await page.waitForTimeout(800);
             await typeAndGetSuggestions();
+            // re-expand if "more" was visible
+            await page.evaluate(() => {
+              const el = document.querySelector('.viewMore a, a[ng-click*="clickViewMore"]');
+              if (el && el.offsetParent !== null) el.click();
+            });
+            await page.waitForTimeout(1000);
           }
           const iterResp = page.waitForResponse(
             res => res.url().includes('publicdse_providersearch'), { timeout: 20000 }
           ).catch(() => null);
           const clicked = await page.evaluate((idx) => {
             const items = Array.from(document.querySelectorAll(
-              'li[ng-repeat], .dropdown-menu li, ul.typeahead li'
-            )).filter(el => el.offsetParent !== null && / - .+, [A-Z]{2}/.test(el.textContent || ''));
-            if (items[idx]) { items[idx].click(); return items[idx].textContent?.trim(); }
+              'li.typeahead_grouping, li[ng-repeat*="specFilter"], li[ng-repeat*="hospFilter"]'
+            )).filter(el => el.offsetParent !== null);
+            if (items[idx]) { items[idx].click(); return items[idx].textContent?.trim().substring(0, 60); }
             return null;
           }, i);
           if (!clicked) continue;
-          console.log(`[Aetna] Clicked suggestion ${i}: ${clicked}`);
+          console.log(`[Aetna] Clicked item ${i}: ${clicked}`);
           const resp = await iterResp;
           if (resp) {
             const body = await resp.text().catch(() => null);
@@ -255,7 +278,7 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
               }
             }
           }
-          if (i < suggestions.length - 1 && allProviders.length < cap) {
+          if (i < suggCount - 1 && allProviders.length < cap) {
             await page.goBack({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
             await page.waitForTimeout(600);
           }
