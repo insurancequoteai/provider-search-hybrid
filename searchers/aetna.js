@@ -40,36 +40,37 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
     // ── Step 1: Landing page → enter ZIP ──────────────────────────────────────
     await page.goto(
       'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearchLanding&site_id=dse&language=en',
-      { waitUntil: 'networkidle', timeout: 30000 }
+      { waitUntil: 'load', timeout: 30000 }  // 'load' not 'networkidle' — skip analytics idle
     );
-    await page.waitForTimeout(2000);
+    // Wait only for the ZIP field, not a fixed 2000ms
     await page.waitForSelector('#zip1', { timeout: 10000 });
     await page.click('#zip1', { clickCount: 3 });
-    await page.type('#zip1', zip, { delay: 100 });
+    await page.type('#zip1', zip, { delay: 30 }); // 30ms vs 100ms per key
     await page.evaluate(() => {
       const el = document.querySelector('#zip1');
       el?.dispatchEvent(new Event('input', { bubbles: true }));
       el?.dispatchEvent(new Event('change', { bubbles: true }));
       el?.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
     });
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(150); // reduced from 500ms
     await page.keyboard.press('Enter');
     await page.waitForURL('**/providerSearchPlanList**', { timeout: 20000 }).catch(() => {});
     if (!page.url().includes('providerSearchPlanList')) {
       await page.locator('button:has-text("Search")').first().click().catch(() => {});
       await page.waitForURL('**/providerSearchPlanList**', { timeout: 15000 }).catch(() => {});
     }
-    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+    // Wait for PPO label to appear — no networkidle needed
+    await page.waitForSelector('label, input[type="radio"]', { timeout: 8000 }).catch(() => {});
 
     // ── Step 2: Select Open Choice PPO ────────────────────────────────────────
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(300); // reduced from 800ms — Angular just needs a tick
     const ppLabel = page.locator('label').filter({ hasText: 'Open Choice' }).first();
     if (await ppLabel.count() > 0) {
       await ppLabel.click();
     } else {
       await page.locator('input[type="radio"][value*="MPPO"]').first().click().catch(() => {});
     }
-    await page.waitForTimeout(800);
+    await page.waitForTimeout(300); // reduced from 800ms
 
     // ── Step 3: Click Continue (not hidden by ng-hide) ────────────────────────
     const contBtn = page.locator('button:not(.ng-hide):has-text("Continue")').first();
@@ -84,26 +85,26 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
       });
     }
     await page.waitForURL('**/providerSearch**', { timeout: 15000 }).catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+    // Wait for the typeahead input to appear — skip networkidle
+    await page.waitForSelector('#Doctors, input[ng-model="criteria.typeAheadSearch"]', { timeout: 10000 }).catch(() => {});
 
     if (isNameSearch) {
-      // ── Name search: iterate each typeahead suggestion ────────────────────────
-      // Each suggestion click navigates to a provider-result page and fires
-      // publicdse_providersearch. We go back after each and repeat for all
-      // suggestions, then return the combined list.
-      await page.waitForTimeout(1000);
+      // ── Name search: expand dropdown then click "(any location)" ─────────────
+      await page.waitForTimeout(400); // reduced from 1000ms
 
-      // Helper: type name into search box and return provider suggestions
+      // Helper: type name into search box and wait for dropdown
       const typeAndGetSuggestions = async () => {
         const inp = page.locator('#Doctors, input[ng-model="criteria.typeAheadSearch"]').first();
         await inp.waitFor({ timeout: 8000 }).catch(() => {});
         await inp.click();
-        await page.waitForTimeout(200);
+        await page.waitForTimeout(100); // reduced from 200ms
         // Clear existing text then type fresh
         await page.keyboard.press('Control+a');
         await page.keyboard.press('Delete');
-        await page.keyboard.type(name, { delay: 80 });
-        await page.waitForTimeout(1600); // let AngularJS fire the typeahead
+        await page.keyboard.type(name, { delay: 20 }); // 20ms vs 80ms per key
+        // Wait for dropdown to appear (event-driven) instead of fixed 1600ms
+        await page.waitForSelector('li.typeahead_grouping, .viewMore a', { timeout: 4000 }).catch(() => {});
+        await page.waitForTimeout(300); // small settle buffer
         return await page.evaluate(() => {
           // Provider suggestions look like "First Last Cred - City, ST"
           return Array.from(document.querySelectorAll('li[ng-repeat], .dropdown-menu li, ul.typeahead li'))
@@ -184,7 +185,9 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
       });
       console.log(`[Aetna] "More providers" link: ${moreClicked}`);
       if (moreClicked) {
-        await page.waitForTimeout(1400); // let expanded list render
+        // Wait for expanded items to render (event-driven)
+        await page.waitForSelector('li.typeahead_grouping', { timeout: 3000 }).catch(() => {});
+        await page.waitForTimeout(300); // settle buffer, reduced from 1400ms
       }
 
       // Step B: try clicking "{name} (any location)" for a single broad-radius call
@@ -217,9 +220,7 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
         if (!resp) throw new Error('Aetna: no provider search API response captured');
         const body = await resp.text().catch(() => null);
         if (!body) throw new Error('Aetna: empty API response');
-        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-        await page.waitForTimeout(600);
-
+        // No networkidle wait — we already have the response body
         const parsed = parseBody(body);
         console.log(`[Aetna] Any-location → ${parsed.length} providers`);
         const seenKeys = new Set();
@@ -245,8 +246,7 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
 
         for (let i = 0; i < suggCount && allProviders.length < cap; i++) {
           if (i > 0) {
-            await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-            await page.waitForTimeout(800);
+            await page.waitForTimeout(400); // reduced from networkidle+800ms
             await typeAndGetSuggestions();
             // re-expand if "more" was visible
             await page.evaluate(() => {
@@ -279,8 +279,8 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
             }
           }
           if (i < suggCount - 1 && allProviders.length < cap) {
-            await page.goBack({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
-            await page.waitForTimeout(600);
+            await page.goBack({ waitUntil: 'load', timeout: 15000 }).catch(() => {});
+            await page.waitForTimeout(300);
           }
         }
         console.log(`[Aetna] Name search total: ${allProviders.length} unique providers`);
