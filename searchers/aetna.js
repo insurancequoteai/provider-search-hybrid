@@ -236,12 +236,15 @@ async function initWarmPage(zip) {
     console.log('[Aetna] API request:', url.substring(0, 200), '| auth keys:', Object.keys(hdrs).filter(k => /auth|ibm|key|token|secret/i.test(k)).join(','));
     if (!_h.reqHeaders) {
       _h.reqHeaders = hdrs;
-      // Extract api base: everything up to and including the version segment
-      const m = url.match(/^(https:\/\/[^/]+\/healthcore\/[^/]+\/v\d+)/);
-      if (m) { _h.apiBase = m[1]; console.log('[Aetna] ✓ apiBase:', _h.apiBase); }
       console.log('[Aetna] ✓ Auth headers captured from:', url.substring(0, 120));
     }
-    if (url.includes('publicdse_providersearch') && !_h.urlTemplate) {
+    // For apiBase, only trust the PUBLIC prod endpoint (api01.aetna.com, not int.aetna.com)
+    // — the int endpoint is private and not reachable from Railway's Node.js https.get()
+    if (!_h.apiBase && url.includes('api01.aetna.com') && !url.includes('int.aetna')) {
+      const m = url.match(/^(https:\/\/[^/]+\/healthcore\/[^/]+\/v\d+)/);
+      if (m) { _h.apiBase = m[1]; console.log('[Aetna] ✓ apiBase (prod):', _h.apiBase); }
+    }
+    if (url.includes('publicdse_providersearch') && !url.includes('int.aetna') && !_h.urlTemplate) {
       _h.urlTemplate = url;
       _h.reqHeaders  = hdrs;
       console.log('[Aetna] ✓ Search URL template captured');
@@ -406,12 +409,13 @@ async function searchAetnaFreshBrowserTypeahead(name, zip, maxResults) {
       if (!url.includes('api01.aetna.com') && !url.includes('healthcore')) return;
       const hdrs = req.headers();
       console.log('[Aetna] Fresh browser API req:', url.substring(0, 150), '| auth keys:', Object.keys(hdrs).filter(k => /auth|ibm|key|token|secret/i.test(k)).join(','));
-      if (!_h.reqHeaders) {
-        _h.reqHeaders = hdrs;
+      if (!_h.reqHeaders) { _h.reqHeaders = hdrs; }
+      // Only use public prod endpoint for apiBase (int.aetna.com not reachable from Node.js)
+      if (!_h.apiBase && url.includes('api01.aetna.com') && !url.includes('int.aetna')) {
         const m = url.match(/^(https:\/\/[^/]+\/healthcore\/[^/]+\/v\d+)/);
         if (m) _h.apiBase = m[1];
       }
-      if (url.includes('publicdse_providersearch') && !_h.urlTemplate) {
+      if (url.includes('publicdse_providersearch') && !url.includes('int.aetna') && !_h.urlTemplate) {
         _h.urlTemplate = url; _h.reqHeaders = hdrs;
         console.log('[Aetna] ✓ Search URL template captured (fresh browser)');
       }
