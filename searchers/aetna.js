@@ -126,17 +126,6 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
       if (!searchClicked) await page.keyboard.press('Enter');
       console.log(`[Aetna] Search submitted: ${searchClicked || 'Enter'}`);
 
-      await page.waitForTimeout(400);
-      // Click Search button or press Enter
-      const searchClicked = await page.evaluate(() => {
-        const btn = Array.from(document.querySelectorAll('button, input[type="submit"]'))
-          .find(el => el.offsetParent !== null && /search|find|go/i.test(el.textContent || el.value || ''));
-        if (btn) { btn.click(); return btn.textContent?.trim() || 'submit'; }
-        return null;
-      });
-      if (!searchClicked) await page.keyboard.press('Enter');
-      console.log(`[Aetna] Name search submitted: ${searchClicked || 'Enter'}`);
-
       await responsePromise;
       await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
       await page.waitForTimeout(800);
