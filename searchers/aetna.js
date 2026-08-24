@@ -14,8 +14,9 @@ chromium.use(StealthPlugin());
 
 // ── Module-level auth cache ───────────────────────────────────────────────────
 const _h = {
-  urlTemplate : null,   // full API URL captured from AngularJS request
-  reqHeaders  : null,   // all request headers (incl. Authorization) from that request
+  urlTemplate : null,   // full API URL captured from AngularJS request (best case)
+  reqHeaders  : null,   // all request headers (incl. x-ibm-client-id) from that request
+  apiBase     : null,   // e.g. 'https://api01.aetna.com/healthcore/prod/v3' (from first captured request)
   browser     : null,   // warm browser kept alive between Railway requests
   page        : null,
   zip         : null,
@@ -98,29 +99,52 @@ const BROWSER_ARGS = [
   '--disable-extensions','--disable-component-update','--safebrowsing-disable-auto-update',
 ];
 
-// ── Direct https using cached auth headers (~3-5s) ────────────────────────────
-async function searchFastHttps(name, maxResults) {
-  if (!_h.urlTemplate || !_h.reqHeaders) throw new Error('No cached headers');
+// ── Direct https using cached x-ibm-client-id (~3-5s) ────────────────────────
+async function searchFastHttps(name, zip, maxResults) {
+  if (!_h.reqHeaders) throw new Error('No cached headers');
 
-  // Replace searchText + timestamp; all other params (pipeName, lat/lon, etc.) stay intact
-  const apiUrl = _h.urlTemplate
-    .replace(/searchText=[^&]*/, `searchText=${encodeURIComponent(name + ' (any location)')}`)
-    .replace(/tmstmp\d+tmstmp/, `tmstmp${Date.now()}tmstmp`);
+  let apiUrl;
+  if (_h.urlTemplate) {
+    // Best case: we have an exact URL captured from a real browser search — just swap name
+    apiUrl = _h.urlTemplate
+      .replace(/searchText=[^&]*/, `searchText=${encodeURIComponent(name + ' (any location)')}`)
+      .replace(/tmstmp\d+tmstmp/, `tmstmp${Date.now()}tmstmp`);
+    console.log('[Aetna] ⚡ Using captured URL template');
+  } else {
+    // We have x-ibm-client-id from page load — construct the URL from known params.
+    // Use the same API base (host + version) we saw on the first captured request,
+    // so int vs prod is handled automatically.
+    const base = _h.apiBase || 'https://api01.aetna.com/healthcore/prod/v3';
+    const params = new URLSearchParams([
+      ['searchText',               name + ' (any location)'],
+      ['pipeName',                 'Open Choice PPO'],
+      ['responseLanguagePreference', 'en'],
+      ['siteId',                   'dse'],
+      ['language',                 'en'],
+      ['postalCode',               zip || '77041'],
+      ['suppressTypeAheadSearchQuery', 'true'],
+      ['radius',                   '75'],
+      ['maxResultCount',           '25'],
+      ['pageNum',                  '1'],
+    ]);
+    apiUrl = `${base}/publicdse_providersearch?${params}`;
+    console.log('[Aetna] ⚡ Constructed URL (no template yet), base:', base);
+  }
 
-  console.log('[Aetna] ⚡ Fast https:', apiUrl.substring(0, 200));
+  console.log('[Aetna] ⚡ Calling:', apiUrl.substring(0, 250));
   const { status, body } = await httpsGet(apiUrl, _h.reqHeaders);
-  console.log('[Aetna] Fast status:', status, '| body:', body.length, 'bytes');
+  console.log('[Aetna] Response:', status, '| length:', body.length, '| prefix:', body.substring(0, 200));
 
   if (status === 401 || status === 403) {
     console.log('[Aetna] Auth expired — clearing cache');
-    _h.urlTemplate = null; _h.reqHeaders = null;
+    _h.urlTemplate = null; _h.reqHeaders = null; _h.apiBase = null;
     _h.page = null; _h.zip = null;
     throw new Error(`Auth expired (${status})`);
   }
-  if (status !== 200) throw new Error(`API error ${status}`);
+  if (status !== 200) throw new Error(`API error ${status}: ${body.substring(0, 300)}`);
 
   const parsed = parseAetnaBody(body);
-  if (!parsed.length) throw new Error('Fast https returned 0 providers');
+  if (!parsed.length) throw new Error(`Fast call returned 0 providers (body: ${body.substring(0, 200)})`);
   return dedup(parsed).slice(0, Math.min(maxResults, 8));
 }
 
@@ -204,7 +228,7 @@ async function initWarmPage(zip) {
   });
 
   // Capture auth headers from ANY api01.aetna.com/healthcore request
-  // (auth token is the same for typeahead and providersearch endpoints)
+  // (x-ibm-client-id is sent on every request — no search interaction needed)
   page.on('request', req => {
     const url = req.url();
     if (!url.includes('api01.aetna.com') && !url.includes('healthcore')) return;
@@ -212,6 +236,9 @@ async function initWarmPage(zip) {
     console.log('[Aetna] API request:', url.substring(0, 200), '| auth keys:', Object.keys(hdrs).filter(k => /auth|ibm|key|token|secret/i.test(k)).join(','));
     if (!_h.reqHeaders) {
       _h.reqHeaders = hdrs;
+      // Extract api base: everything up to and including the version segment
+      const m = url.match(/^(https:\/\/[^/]+\/healthcore\/[^/]+\/v\d+)/);
+      if (m) { _h.apiBase = m[1]; console.log('[Aetna] ✓ apiBase:', _h.apiBase); }
       console.log('[Aetna] ✓ Auth headers captured from:', url.substring(0, 120));
     }
     if (url.includes('publicdse_providersearch') && !_h.urlTemplate) {
@@ -316,9 +343,10 @@ async function searchAetna({
   if (isNameSearch) {
 
     // 1. If we already have cached headers → direct https (~3-5s)
-    if (_h.urlTemplate && _h.reqHeaders) {
+    //    (urlTemplate is optional — we can construct the URL from known params if needed)
+    if (_h.reqHeaders) {
       try {
-        const results = await searchFastHttps(name, maxResults);
+        const results = await searchFastHttps(name, zip, maxResults);
         console.log(`[Aetna] ⚡ Fast success: ${results.length} providers`);
         return results;
       } catch (e) {
@@ -336,9 +364,9 @@ async function searchAetna({
       console.log('[Aetna] Warm-up failed:', e.message);
     }
 
-    if (_h.urlTemplate && _h.reqHeaders) {
+    if (_h.reqHeaders) {
       try {
-        const results = await searchFastHttps(name, maxResults);
+        const results = await searchFastHttps(name, zip, maxResults);
         console.log(`[Aetna] ⚡ Fast success (after warm): ${results.length} providers`);
         return results;
       } catch (e) {
@@ -378,7 +406,11 @@ async function searchAetnaFreshBrowserTypeahead(name, zip, maxResults) {
       if (!url.includes('api01.aetna.com') && !url.includes('healthcore')) return;
       const hdrs = req.headers();
       console.log('[Aetna] Fresh browser API req:', url.substring(0, 150), '| auth keys:', Object.keys(hdrs).filter(k => /auth|ibm|key|token|secret/i.test(k)).join(','));
-      if (!_h.reqHeaders) { _h.reqHeaders = hdrs; }
+      if (!_h.reqHeaders) {
+        _h.reqHeaders = hdrs;
+        const m = url.match(/^(https:\/\/[^/]+\/healthcore\/[^/]+\/v\d+)/);
+        if (m) _h.apiBase = m[1];
+      }
       if (url.includes('publicdse_providersearch') && !_h.urlTemplate) {
         _h.urlTemplate = url; _h.reqHeaders = hdrs;
         console.log('[Aetna] ✓ Search URL template captured (fresh browser)');
@@ -414,9 +446,9 @@ async function searchAetnaFreshBrowserTypeahead(name, zip, maxResults) {
     }
 
     // Now try fast path (headers should be captured by now)
-    if (_h.urlTemplate && _h.reqHeaders) {
+    if (_h.reqHeaders) {
       try {
-        const results = await searchFastHttps(name, maxResults);
+        const results = await searchFastHttps(name, zip, maxResults);
         // Promote this browser as the new warm page
         if (_h.browser) { try { await _h.browser.close(); } catch {} }
         _h.browser = browser; _h.page = page; _h.zip = zip;
