@@ -113,31 +113,40 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
       };
 
       // Helper: parse a captured API body into normalized providers
+      const decodeHtml = s => (s || '').replace(/&#38;/g,'&').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>');
       const parseBody = (body) => {
         try {
           const data = JSON.parse(body);
-          const list = data?.providersResponse?.readProvidersResponse?.providerInfoResponses || [];
+          // Handle both array and single-object providerInfoResponses
+          const raw = data?.providersResponse?.readProvidersResponse?.providerInfoResponses;
+          const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
+          if (list.length === 0) {
+            // Log first 300 chars of body to help diagnose structure issues
+            console.log('[Aetna] parseBody: empty list, body prefix:', body.substring(0, 300));
+          }
           return list.map(p => {
             const info = p.providerInformation || {};
-            const loc  = p.providerLocations  || {};
+            // providerLocations can be array or single object
+            const locRaw = p.providerLocations;
+            const loc  = Array.isArray(locRaw) ? locRaw[0] : (locRaw || {});
             const addr = loc.address   || {};
             const contacts = loc.contacts || {};
             let specialtyDesc = '';
             const spec = p.providerSpecialties;
             if (Array.isArray(spec)) specialtyDesc = spec[0]?.specialty?.description || '';
             else if (spec?.specialty) specialtyDesc = spec.specialty.description || '';
-            specialtyDesc = specialtyDesc.replace(/&#38;/g,'&').replace(/&amp;/g,'&');
+            specialtyDesc = decodeHtml(specialtyDesc);
             const desigs = Array.isArray(p.providerDesignations) ? p.providerDesignations
               : p.providerDesignations ? [p.providerDesignations] : [];
             return {
               network: 'Aetna Open Choice PPO',
-              name: info.providerDisplayName?.full || '',
+              name: decodeHtml(info.providerDisplayName?.full || ''),
               npi:  info.primaryNPI?.nationalProviderId || '',
               providerType: info.type || '',
               specialty: specialtyDesc,
               address: {
-                street: addr.streetLine1 || '', building: addr.buildingName || '',
-                city: addr.city || '', county: addr.county || '',
+                street: decodeHtml(addr.streetLine1 || ''), building: decodeHtml(addr.buildingName || ''),
+                city: decodeHtml(addr.city || ''), county: decodeHtml(addr.county || ''),
                 state: addr.state || '', zip: addr.postalCode || '',
               },
               phone: contacts.phonesVoice?.number || p.contacts?.primaryPhone?.number || '',
@@ -151,65 +160,109 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
               locationId: loc.locationID   || '',
             };
           });
-        } catch { return []; }
+        } catch(e) { console.log('[Aetna] parseBody error:', e.message); return []; }
       };
 
-      // ── Main iteration ────────────────────────────────────────────────────────
-      const suggestions = await typeAndGetSuggestions();
-      console.log(`[Aetna] Suggestions found: ${JSON.stringify(suggestions)}`);
-
-      const allProviders = [];
-      const seenKeys = new Set();
+      // ── Main search: expand full list then click "(any location)" ───────────────
+      await typeAndGetSuggestions(); // type and wait for dropdown to appear
       const cap = Math.min(maxResults, 8);
 
-      for (let i = 0; i < suggestions.length && allProviders.length < cap; i++) {
-        // Re-type to get fresh dropdown (needed after each navigation)
-        if (i > 0) {
-          await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-          await page.waitForTimeout(800);
-          const fresh = await typeAndGetSuggestions();
-          console.log(`[Aetna] Re-typed, got ${fresh.length} suggestions`);
-        }
-
-        const respPromise = page.waitForResponse(
-          res => res.url().includes('publicdse_providersearch'),
-          { timeout: 20000 }
-        ).catch(() => null);
-
-        // Click suggestion at index i
-        const clicked = await page.evaluate((idx) => {
-          const items = Array.from(document.querySelectorAll(
-            'li[ng-repeat], .dropdown-menu li, ul.typeahead li'
-          )).filter(el => el.offsetParent !== null && / - .+, [A-Z]{2}/.test(el.textContent || ''));
-          if (items[idx]) { items[idx].click(); return items[idx].textContent?.trim(); }
-          return null;
-        }, i);
-
-        if (!clicked) { console.log(`[Aetna] Suggestion ${i} not found, skipping`); continue; }
-        console.log(`[Aetna] Clicked suggestion ${i}: ${clicked}`);
-
-        const resp = await respPromise;
-        if (resp) {
-          const body = await resp.text().catch(() => null);
-          if (body) {
-            const parsed = parseBody(body);
-            console.log(`[Aetna] Suggestion ${i} → ${parsed.length} locations`);
-            for (const p of parsed) {
-              const key = `${p.npi}|${p.address.street}`;
-              if (!seenKeys.has(key)) { seenKeys.add(key); allProviders.push(p); }
-            }
-          }
-        }
-
-        // Go back for the next iteration (unless we're done)
-        if (i < suggestions.length - 1 && allProviders.length < cap) {
-          await page.goBack({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
-          await page.waitForTimeout(600);
-        }
+      // Step A: click "X more Healthcare Providers & Practices »" to expand full dropdown
+      const moreClicked = await page.evaluate(() => {
+        const el = Array.from(document.querySelectorAll('li, a, div, span, button'))
+          .find(el => el.offsetParent !== null && /\d+\s+more\s+Healthcare\s+Providers/i.test(el.textContent || ''));
+        if (el) { el.click(); return el.textContent?.trim(); }
+        return null;
+      });
+      console.log(`[Aetna] "More providers" link: ${moreClicked}`);
+      if (moreClicked) {
+        await page.waitForTimeout(1200); // let expanded list render
       }
 
-      console.log(`[Aetna] Name search total: ${allProviders.length} unique providers`);
-      return allProviders.slice(0, cap);
+      const respPromise = page.waitForResponse(
+        res => res.url().includes('publicdse_providersearch'),
+        { timeout: 35000 }
+      ).catch(() => null);
+
+      // Step B: click "{name} (any location)" from the (now expanded) dropdown
+      const anyLocationClicked = await page.evaluate((searchName) => {
+        const pattern = new RegExp(searchName.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '\\s*\\(any location\\)', 'i');
+        const el = Array.from(document.querySelectorAll('li, a, div, span, button'))
+          .find(el => el.offsetParent !== null && pattern.test(el.textContent || ''));
+        if (el) { el.click(); return el.textContent?.trim(); }
+        return null;
+      }, name);
+      console.log(`[Aetna] Any-location option: ${anyLocationClicked}`);
+
+      if (anyLocationClicked) {
+        // Wait for the broad search results
+        const resp = await respPromise;
+        if (!resp) throw new Error('Aetna: no provider search API response captured');
+        const body = await resp.text().catch(() => null);
+        if (!body) throw new Error('Aetna: empty API response');
+        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+        await page.waitForTimeout(600);
+
+        const parsed = parseBody(body);
+        console.log(`[Aetna] Any-location → ${parsed.length} providers`);
+        const seenKeys = new Set();
+        const result = [];
+        for (const p of parsed) {
+          const key = p.locationId || `${p.npi}|${p.address.street}`;
+          if (!seenKeys.has(key)) { seenKeys.add(key); result.push(p); }
+        }
+        return result.slice(0, cap);
+
+      } else {
+        // Fallback: iterate individual suggestions
+        console.log('[Aetna] No any-location option found, iterating suggestions');
+        const suggestions = await page.evaluate(() =>
+          Array.from(document.querySelectorAll('li[ng-repeat], .dropdown-menu li, ul.typeahead li'))
+            .filter(el => el.offsetParent !== null && / - .+, [A-Z]{2}/.test(el.textContent || ''))
+            .map(el => el.textContent?.trim())
+        );
+        console.log(`[Aetna] Suggestions: ${JSON.stringify(suggestions)}`);
+
+        const allProviders = [];
+        const seenKeys = new Set();
+
+        for (let i = 0; i < suggestions.length && allProviders.length < cap; i++) {
+          if (i > 0) {
+            await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+            await page.waitForTimeout(800);
+            await typeAndGetSuggestions();
+          }
+          const iterResp = page.waitForResponse(
+            res => res.url().includes('publicdse_providersearch'), { timeout: 20000 }
+          ).catch(() => null);
+          const clicked = await page.evaluate((idx) => {
+            const items = Array.from(document.querySelectorAll(
+              'li[ng-repeat], .dropdown-menu li, ul.typeahead li'
+            )).filter(el => el.offsetParent !== null && / - .+, [A-Z]{2}/.test(el.textContent || ''));
+            if (items[idx]) { items[idx].click(); return items[idx].textContent?.trim(); }
+            return null;
+          }, i);
+          if (!clicked) continue;
+          console.log(`[Aetna] Clicked suggestion ${i}: ${clicked}`);
+          const resp = await iterResp;
+          if (resp) {
+            const body = await resp.text().catch(() => null);
+            if (body) {
+              const parsed = parseBody(body);
+              for (const p of parsed) {
+                const key = p.locationId || `${p.npi}|${p.address.street}`;
+                if (!seenKeys.has(key)) { seenKeys.add(key); allProviders.push(p); }
+              }
+            }
+          }
+          if (i < suggestions.length - 1 && allProviders.length < cap) {
+            await page.goBack({ waitUntil: 'networkidle', timeout: 15000 }).catch(() => {});
+            await page.waitForTimeout(600);
+          }
+        }
+        console.log(`[Aetna] Name search total: ${allProviders.length} unique providers`);
+        return allProviders.slice(0, cap);
+      }
 
     } else {
       // ── Specialty search (existing flow) ─────────────────────────────────────
