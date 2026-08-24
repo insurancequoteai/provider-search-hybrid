@@ -108,22 +108,34 @@ async function searchViaAngular(name, zip, maxResults) {
 
   console.log('[Aetna] ⚡ Warm-page typeahead search for:', name);
 
-  // Capture ANY provider search response — covers both api01.aetna.com and api01.int.aetna.com
+  // Capture the provider search response — listen on ANY api01 host for any provider endpoint.
+  // During warm-up we saw requests go to BOTH api01.int.aetna.com and api01.aetna.com in parallel.
   const bodyPromise = new Promise((resolve) => {
     const timeout = setTimeout(() => {
       _h.page.off('response', handler);
-      console.log('[Aetna] Response timeout after 20s');
+      console.log('[Aetna] Response timeout after 25s — no provider search response received');
       resolve(null);
-    }, 20000);
+    }, 25000);
     const handler = async (res) => {
       const url = res.url();
-      // Match both endpoint name variants
+      // Log any api01 response for diagnostics
+      if (url.includes('api01') && url.includes('aetna')) {
+        const ep = url.split('/').pop()?.split('?')[0] || '';
+        if (ep && ep !== 'publicdse_pagecontent') {
+          console.log('[Aetna] api01 response:', res.status(), ep, '|', url.substring(0, 120));
+        }
+      }
+      // Resolve on any provider search endpoint
       if (!url.includes('providersearch') && !url.includes('publicdse_provider')) return;
       clearTimeout(timeout);
       _h.page.off('response', handler);
-      console.log('[Aetna] Provider search response:', res.status(), url.substring(0, 160));
+      console.log('[Aetna] ✓ Provider search response:', res.status(), url.substring(0, 160));
       if (res.status() >= 400) {
-        console.log('[Aetna] Non-2xx status, resolving null');
+        console.log('[Aetna] Error status — will try to read body for diagnostics');
+        try {
+          const errBody = await res.text();
+          console.log('[Aetna] Error body:', errBody.substring(0, 200));
+        } catch {}
         resolve(null);
         return;
       }
@@ -143,10 +155,20 @@ async function searchViaAngular(name, zip, maxResults) {
     await _h.page.waitForTimeout(100);
     await inp.fill('');
     await _h.page.waitForTimeout(150);
-    // Need ≥3 chars to trigger typeahead
+    // Need ≥3 chars; typing alone triggers typeahead dropdown only — Enter triggers actual search
     const query = name.length >= 3 ? name.substring(0, 25) : name + ' aa';
     await inp.type(query, { delay: 40 });
-    console.log('[Aetna] Typed query into search box:', query);
+    await _h.page.waitForTimeout(300);
+    // Press Enter to trigger the real publicdse_providersearch (not just the dropdown suggestions)
+    await _h.page.keyboard.press('Enter');
+    console.log('[Aetna] Typed + Enter for query:', query);
+    // If Enter didn't work, click the search/submit button
+    await _h.page.waitForTimeout(400);
+    await _h.page.evaluate(() => {
+      const btn = Array.from(document.querySelectorAll('button, input[type="submit"]'))
+        .find(b => b.offsetParent && /search|find|go|submit/i.test(b.textContent + b.value + b.type));
+      if (btn) { console.log('[Aetna-page] Clicking search btn:', btn.textContent?.trim()); btn.click(); }
+    });
   } else {
     // Search box gone — page may have navigated away. Try Angular $http as fallback.
     console.log('[Aetna] Search box not found, trying Angular $http fallback...');
@@ -303,21 +325,14 @@ async function initWarmPage(zip) {
       await inp.click();
       await page.waitForTimeout(200);
       await inp.fill('smith');
-      await page.evaluate(() => {
-        const el = document.querySelector('#Doctors, input[ng-model="criteria.typeAheadSearch"]');
-        if (!el) return;
-        ['input', 'change', 'keyup'].forEach(t => el.dispatchEvent(new Event(t, { bubbles: true })));
-        try {
-          const sc = window.angular?.element(el)?.scope?.();
-          if (sc?.criteria !== undefined) { sc.criteria.typeAheadSearch = 'smith'; }
-          if (sc?.$apply) sc.$apply(() => {});
-        } catch {}
-      });
-      // Wait up to 8s for any provider search response — captures URL + auth
+      await page.waitForTimeout(200);
+      // Press Enter to trigger actual provider search (typing alone only opens dropdown)
+      await page.keyboard.press('Enter');
+      // Wait up to 12s for provider search response — will capture URL + auth if it comes through
       await page.waitForResponse(
         r => r.url().includes('providersearch') || r.url().includes('publicdse_provider'),
-        { timeout: 8000 }
-      ).catch(() => console.log('[Aetna] No provider search response during warm-up typeahead (ok)'));
+        { timeout: 12000 }
+      ).catch(() => console.log('[Aetna] No provider search response during warm-up (ok, will search on demand)'));
       await page.waitForTimeout(300);
     } catch (e) {
       console.log('[Aetna] Typeahead trigger error:', e.message);
