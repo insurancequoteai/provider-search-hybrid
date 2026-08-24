@@ -63,65 +63,55 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
       }
     });
 
-    // ── FAST PATH: jump directly to providerSearch, skip landing + plan pages ──
-    // This saves ~20s if AngularJS allows direct access (it often does on DSE).
+    // ── Step 1: Landing page → enter ZIP ──────────────────────────────────────
+    // domcontentloaded fires as soon as HTML parses — before tracking scripts run.
+    // We wait for #zip1 specifically, so AngularJS readiness is handled by that selector.
     await page.goto(
-      'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearch&site_id=dse&language=en',
-      { waitUntil: 'load', timeout: 30000 }
+      'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearchLanding&site_id=dse&language=en',
+      { waitUntil: 'domcontentloaded', timeout: 30000 }
     );
-    await page.waitForTimeout(1500); // let AngularJS route and render
-    const onSearch = page.url().includes('providerSearch') && !page.url().includes('Landing') && !page.url().includes('PlanList');
-    const fastInputReady = onSearch && await page.waitForSelector(
-      '#Doctors, input[ng-model="criteria.typeAheadSearch"]',
-      { timeout: 5000 }
-    ).then(() => true).catch(() => false);
-    console.log(`[Aetna] Fast path: ${fastInputReady ? 'SUCCESS' : 'failed, using full flow'}`);
+    await page.waitForSelector('#zip1', { timeout: 15000 });
+    await page.click('#zip1', { clickCount: 3 });
+    await page.type('#zip1', zip, { delay: 30 });
+    await page.evaluate(() => {
+      const el = document.querySelector('#zip1');
+      el?.dispatchEvent(new Event('input', { bubbles: true }));
+      el?.dispatchEvent(new Event('change', { bubbles: true }));
+      el?.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+    });
+    await page.waitForTimeout(150);
+    await page.keyboard.press('Enter');
+    await page.waitForURL('**/providerSearchPlanList**', { timeout: 20000 }).catch(() => {});
+    if (!page.url().includes('providerSearchPlanList')) {
+      await page.locator('button:has-text("Search")').first().click().catch(() => {});
+      await page.waitForURL('**/providerSearchPlanList**', { timeout: 15000 }).catch(() => {});
+    }
+    await page.waitForSelector('label, input[type="radio"]', { timeout: 8000 }).catch(() => {});
 
-    if (!fastInputReady) {
-      // ── FULL PATH: landing → ZIP → planList → plan → providerSearch ───────────
-      await page.goto(
-        'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearchLanding&site_id=dse&language=en',
-        { waitUntil: 'load', timeout: 30000 }
-      );
-      await page.waitForSelector('#zip1', { timeout: 10000 });
-      await page.click('#zip1', { clickCount: 3 });
-      await page.type('#zip1', zip, { delay: 30 });
+    // ── Step 2: Select Open Choice PPO ────────────────────────────────────────
+    await page.waitForTimeout(300);
+    const ppLabel = page.locator('label').filter({ hasText: 'Open Choice' }).first();
+    if (await ppLabel.count() > 0) {
+      await ppLabel.click();
+    } else {
+      await page.locator('input[type="radio"][value*="MPPO"]').first().click().catch(() => {});
+    }
+    await page.waitForTimeout(300);
+
+    // ── Step 3: Click Continue ────────────────────────────────────────────────
+    const contBtn = page.locator('button:not(.ng-hide):has-text("Continue")').first();
+    if (await contBtn.count() > 0) {
+      await contBtn.click();
+    } else {
       await page.evaluate(() => {
-        const el = document.querySelector('#zip1');
-        el?.dispatchEvent(new Event('input', { bubbles: true }));
-        el?.dispatchEvent(new Event('change', { bubbles: true }));
-        el?.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+        const btn = Array.from(document.querySelectorAll('button')).find(b =>
+          b.textContent?.includes('Continue') && !b.classList.contains('ng-hide') && b.offsetParent !== null
+        );
+        if (btn) btn.click();
       });
-      await page.waitForTimeout(150);
-      await page.keyboard.press('Enter');
-      await page.waitForURL('**/providerSearchPlanList**', { timeout: 20000 }).catch(() => {});
-      if (!page.url().includes('providerSearchPlanList')) {
-        await page.locator('button:has-text("Search")').first().click().catch(() => {});
-        await page.waitForURL('**/providerSearchPlanList**', { timeout: 15000 }).catch(() => {});
-      }
-      await page.waitForSelector('label, input[type="radio"]', { timeout: 8000 }).catch(() => {});
-      await page.waitForTimeout(300);
-      const ppLabel = page.locator('label').filter({ hasText: 'Open Choice' }).first();
-      if (await ppLabel.count() > 0) {
-        await ppLabel.click();
-      } else {
-        await page.locator('input[type="radio"][value*="MPPO"]').first().click().catch(() => {});
-      }
-      await page.waitForTimeout(300);
-      const contBtn = page.locator('button:not(.ng-hide):has-text("Continue")').first();
-      if (await contBtn.count() > 0) {
-        await contBtn.click();
-      } else {
-        await page.evaluate(() => {
-          const btn = Array.from(document.querySelectorAll('button')).find(b =>
-            b.textContent?.includes('Continue') && !b.classList.contains('ng-hide') && b.offsetParent !== null
-          );
-          if (btn) btn.click();
-        });
-      }
-      await page.waitForURL('**/providerSearch**', { timeout: 15000 }).catch(() => {});
-      await page.waitForSelector('#Doctors, input[ng-model="criteria.typeAheadSearch"]', { timeout: 10000 }).catch(() => {});
-    };
+    }
+    await page.waitForURL('**/providerSearch**', { timeout: 15000 }).catch(() => {});
+    await page.waitForSelector('#Doctors, input[ng-model="criteria.typeAheadSearch"]', { timeout: 10000 }).catch(() => {});;
 
     if (isNameSearch) {
       // ── Name search: expand dropdown then click "(any location)" ─────────────

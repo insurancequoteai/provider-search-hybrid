@@ -280,16 +280,33 @@ module.exports = async function firsthealthSearch({ zip, name, specialty, npi } 
           }
         }
 
+        // Parse addressLines into object { street, city, state, zip }
+        // Typical FH format: ["123 Main St", "Tampa, FL 33701"]
+        let street = '', city = '', state = '', zip = '';
+        if (addressLines.length > 0) {
+          street = addressLines[0] || '';
+          const last = addressLines[addressLines.length - 1] || '';
+          const m = last.match(/^(.*?),\s*([A-Z]{2})\s*(\d{5})?/);
+          if (m) { city = m[1].trim(); state = m[2]; zip = m[3] || ''; }
+          else if (addressLines.length === 1) {
+            // Single line — try to split on last comma
+            const parts = last.split(',');
+            street = parts[0]?.trim() || last;
+            city   = parts[1]?.trim() || '';
+          }
+        }
         return {
           network: 'First Health PPO',
           name: providerName,
           specialty,
-          address: addressLines.join(', '),
+          address: { street, city, state, zip },
           phone,
-          distance,
+          distance: parseFloat(distance) || null,
           primaryCare,
           acceptingNewPatients: true,
+          inNetwork: true,
           npi: '',
+          providerType: '',
         };
       }).filter(Boolean);
     });
