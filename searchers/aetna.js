@@ -1,21 +1,22 @@
 // searchers/aetna.js
 //
 // Strategy:
-//   1st name search : warm browser on providerSearch → typeahead → intercept headers → return results  (~55 s)
-//   2nd+ name search: direct https.get() using cached URL template + auth headers                      (3-5 s)
-//   Token expired   : clear cache → re-warm → fresh typeahead → re-capture headers
-//   Specialty search: always fresh browser
+//   Warm-up (once, ~50s): browser navigates to providerSearch, types one char → captures
+//                          auth headers from the intercepted API request
+//   Name search  (3-5s) : direct https.get() with cached URL template + auth headers
+//   Token expired       : clear cache → re-warm automatically
+//   Specialty search    : fresh browser (navigates to different sub-page)
 //
 const https = require('https');
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
 
-// ── Module-level auth/URL cache ───────────────────────────────────────────────
-const _h = {                // "hot" cache
-  urlTemplate : null,       // Full API URL from first real browser request
-  reqHeaders  : null,       // ALL headers (incl. Authorization) from that request
-  browser     : null,
+// ── Module-level auth cache ───────────────────────────────────────────────────
+const _h = {
+  urlTemplate : null,   // full API URL captured from AngularJS request
+  reqHeaders  : null,   // all request headers (incl. Authorization) from that request
+  browser     : null,   // warm browser kept alive between Railway requests
   page        : null,
   zip         : null,
   initPromise : null,
@@ -33,17 +34,18 @@ function parseAetnaBody(body) {
     const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
     if (!list.length) console.log('[Aetna] parseBody: empty, prefix:', body.slice(0, 200));
     return list.map(p => {
-      const info     = p.providerInformation || {};
-      const locRaw   = p.providerLocations;
-      const loc      = Array.isArray(locRaw) ? locRaw[0] : (locRaw || {});
-      const addr     = loc.address   || {};
-      const contacts = loc.contacts  || {};
+      const info   = p.providerInformation || {};
+      const locRaw = p.providerLocations;
+      const loc    = Array.isArray(locRaw) ? locRaw[0] : (locRaw || {});
+      const addr   = loc.address   || {};
+      const cont   = loc.contacts  || {};
       let spec = '';
       const sp = p.providerSpecialties;
       if (Array.isArray(sp)) spec = sp[0]?.specialty?.description || '';
       else if (sp?.specialty) spec = sp.specialty.description || '';
       spec = decodeHtml(spec);
-      const desigs = Array.isArray(p.providerDesignations) ? p.providerDesignations
+      const desigs = Array.isArray(p.providerDesignations)
+        ? p.providerDesignations
         : p.providerDesignations ? [p.providerDesignations] : [];
       return {
         network: 'Aetna Open Choice PPO',
@@ -52,14 +54,13 @@ function parseAetnaBody(body) {
         providerType: info.type || '',
         specialty: spec,
         address: {
-          street: decodeHtml(addr.streetLine1 || ''), building: decodeHtml(addr.buildingName || ''),
-          city:   decodeHtml(addr.city || ''),        county:   decodeHtml(addr.county || ''),
-          state:  addr.state || '',                   zip:      addr.postalCode || '',
+          street: decodeHtml(addr.streetLine1   || ''),
+          city:   decodeHtml(addr.city          || ''),
+          state:  addr.state      || '',
+          zip:    addr.postalCode || '',
         },
-        phone:    contacts.phonesVoice?.number || p.contacts?.primaryPhone?.number || '',
+        phone:    cont.phonesVoice?.number || p.contacts?.primaryPhone?.number || '',
         distance: parseFloat(addr.distance)  || null,
-        latitude: parseFloat(addr.latitude)  || null,
-        longitude:parseFloat(addr.longitude) || null,
         acceptingNewPatients: loc.acceptsNewPatients === 'Y',
         virtualVisits: desigs.some(d => ['TELEMED','VIDCONF'].includes(d.code)),
         inNetwork: true,
@@ -86,7 +87,7 @@ function httpsGet(url, headers = {}) {
       res.on('end', () => resolve({ status: res.statusCode, body }));
     });
     req.on('error', reject);
-    req.setTimeout(15000, () => { req.destroy(); reject(new Error('timeout')); });
+    req.setTimeout(20000, () => { req.destroy(); reject(new Error('https timeout')); });
   });
 }
 
@@ -97,35 +98,83 @@ const BROWSER_ARGS = [
   '--disable-extensions','--disable-component-update','--safebrowsing-disable-auto-update',
 ];
 
-// ── Direct https call using cached auth headers (~3-5 s) ──────────────────────
-async function searchFastHttps(name, zip, maxResults) {
-  if (!_h.urlTemplate || !_h.reqHeaders) throw new Error('No cached headers yet');
+// ── Direct https using cached auth headers (~3-5s) ────────────────────────────
+async function searchFastHttps(name, maxResults) {
+  if (!_h.urlTemplate || !_h.reqHeaders) throw new Error('No cached headers');
 
-  // Swap searchText + timestamp; preserve all other params (pipeName, lat/lon, etc.)
+  // Replace searchText + timestamp; all other params (pipeName, lat/lon, etc.) stay intact
   const apiUrl = _h.urlTemplate
-    .replace(/searchText=[^&]*/,  `searchText=${encodeURIComponent(name + ' (any location)')}`)
-    .replace(/tmstmp\d+tmstmp/,   `tmstmp${Date.now()}tmstmp`);
+    .replace(/searchText=[^&]*/, `searchText=${encodeURIComponent(name + ' (any location)')}`)
+    .replace(/tmstmp\d+tmstmp/, `tmstmp${Date.now()}tmstmp`);
 
-  console.log('[Aetna] ⚡ Fast https:', apiUrl.substring(0, 180));
-
+  console.log('[Aetna] ⚡ Fast https:', apiUrl.substring(0, 200));
   const { status, body } = await httpsGet(apiUrl, _h.reqHeaders);
-  console.log('[Aetna] Fast https status:', status, 'body length:', body.length);
+  console.log('[Aetna] Fast status:', status, '| body:', body.length, 'bytes');
 
   if (status === 401 || status === 403) {
-    // Auth token expired — clear cache so next call re-warms
-    console.log('[Aetna] Auth expired — clearing cache, will re-warm');
+    console.log('[Aetna] Auth expired — clearing cache');
     _h.urlTemplate = null; _h.reqHeaders = null;
     _h.page = null; _h.zip = null;
     throw new Error(`Auth expired (${status})`);
   }
-  if (status !== 200) throw new Error(`API status ${status}`);
+  if (status !== 200) throw new Error(`API error ${status}`);
 
   const parsed = parseAetnaBody(body);
   if (!parsed.length) throw new Error('Fast https returned 0 providers');
   return dedup(parsed).slice(0, Math.min(maxResults, 8));
 }
 
-// ── Warm browser: navigate to providerSearch and wait ────────────────────────
+// ── Navigate browser to providerSearch page ───────────────────────────────────
+async function navigateToSearch(page, zip) {
+  // Step 1: landing
+  await page.goto(
+    'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearchLanding&site_id=dse&language=en',
+    { waitUntil: 'domcontentloaded', timeout: 30000 }
+  );
+  await page.waitForSelector('#zip1', { timeout: 15000 });
+  await page.click('#zip1', { clickCount: 3 });
+  await page.type('#zip1', zip, { delay: 30 });
+  await page.evaluate(() => {
+    const el = document.querySelector('#zip1');
+    el?.dispatchEvent(new Event('input',  { bubbles: true }));
+    el?.dispatchEvent(new Event('change', { bubbles: true }));
+    el?.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+  });
+  await page.waitForTimeout(150);
+  await page.keyboard.press('Enter');
+  await page.waitForURL('**/providerSearchPlanList**', { timeout: 20000 }).catch(() => {});
+  if (!page.url().includes('providerSearchPlanList')) {
+    await page.locator('button:has-text("Search")').first().click().catch(() => {});
+    await page.waitForURL('**/providerSearchPlanList**', { timeout: 15000 }).catch(() => {});
+  }
+
+  // Step 2: select Open Choice PPO
+  await page.waitForSelector('label, input[type="radio"]', { timeout: 8000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  const ppLabel = page.locator('label').filter({ hasText: 'Open Choice' }).first();
+  if (await ppLabel.count() > 0) {
+    await ppLabel.click();
+  } else {
+    await page.locator('input[type="radio"][value*="MPPO"]').first().click().catch(() => {});
+  }
+  await page.waitForTimeout(300);
+
+  // Step 3: Continue
+  const contBtn = page.locator('button:not(.ng-hide):has-text("Continue")').first();
+  if (await contBtn.count() > 0) {
+    await contBtn.click();
+  } else {
+    await page.evaluate(() => {
+      const b = Array.from(document.querySelectorAll('button'))
+        .find(b => b.textContent?.includes('Continue') && !b.classList.contains('ng-hide') && b.offsetParent);
+      if (b) b.click();
+    });
+  }
+  await page.waitForURL('**/providerSearch**', { timeout: 15000 }).catch(() => {});
+  await page.waitForSelector('#Doctors, input[ng-model="criteria.typeAheadSearch"]', { timeout: 10000 }).catch(() => {});
+}
+
+// ── Warm browser: navigate + type one char to capture auth headers ────────────
 async function initWarmPage(zip) {
   console.log(`[Aetna] Warming browser for ZIP ${zip}...`);
   const t0 = Date.now();
@@ -147,137 +196,51 @@ async function initWarmPage(zip) {
     'Accept-Language': 'en-US,en;q=0.9',
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   });
-
   await page.route('**', route => {
-    const type = route.request().resourceType();
-    const url  = route.request().url();
-    if (['image','media','font'].includes(type)) return route.abort();
-    if (/google-analytics|googletagmanager|doubleclick|adobe|omniture|mbox/i.test(url)) return route.abort();
+    const t = route.request().resourceType(), u = route.request().url();
+    if (['image','media','font'].includes(t)) return route.abort();
+    if (/google-analytics|googletagmanager|doubleclick|adobe|omniture|mbox/i.test(u)) return route.abort();
     return route.continue();
   });
 
-  // THIS IS THE KEY: capture URL + auth headers from the first real API call
+  // ★ THE KEY: capture URL template + ALL auth headers from the real browser request
   page.on('request', req => {
-    if (req.url().includes('publicdse_providersearch') && !_h.urlTemplate) {
+    if (req.url().includes('publicdse_providersearch')) {
       _h.urlTemplate = req.url();
       _h.reqHeaders  = req.headers();
-      console.log('[Aetna] ✓ Captured URL template + auth headers');
+      console.log('[Aetna] ✓ Auth headers captured! URL:', req.url().substring(0, 200));
     }
   });
 
-  // Step 1: landing → ZIP
-  await page.goto(
-    'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearchLanding&site_id=dse&language=en',
-    { waitUntil: 'domcontentloaded', timeout: 30000 }
-  );
-  await page.waitForSelector('#zip1', { timeout: 15000 });
-  await page.click('#zip1', { clickCount: 3 });
-  await page.type('#zip1', zip, { delay: 30 });
-  await page.evaluate(() => {
-    const el = document.querySelector('#zip1');
-    el?.dispatchEvent(new Event('input',  { bubbles: true }));
-    el?.dispatchEvent(new Event('change', { bubbles: true }));
-    el?.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-  });
-  await page.waitForTimeout(150);
-  await page.keyboard.press('Enter');
-  await page.waitForURL('**/providerSearchPlanList**', { timeout: 20000 }).catch(() => {});
-  if (!page.url().includes('providerSearchPlanList')) {
-    await page.locator('button:has-text("Search")').first().click().catch(() => {});
-    await page.waitForURL('**/providerSearchPlanList**', { timeout: 15000 }).catch(() => {});
-  }
-  await page.waitForSelector('label, input[type="radio"]', { timeout: 8000 }).catch(() => {});
+  await navigateToSearch(page, zip);
 
-  // Step 2: Open Choice PPO
-  await page.waitForTimeout(300);
-  const ppLabel = page.locator('label').filter({ hasText: 'Open Choice' }).first();
-  if (await ppLabel.count() > 0) {
-    await ppLabel.click();
-  } else {
-    await page.locator('input[type="radio"][value*="MPPO"]').first().click().catch(() => {});
+  // Type 3+ characters — AngularJS requires at least 3 chars before it fires the API
+  // page.on('request') above captures the URL + auth headers from that call
+  const inp = page.locator('#Doctors, input[ng-model="criteria.typeAheadSearch"]').first();
+  if (await inp.count() > 0) {
+    await inp.click();
+    await page.keyboard.type('smith', { delay: 50 });
+    // Wait for the API request to fire (AngularJS debounce ~300ms + network)
+    await page.waitForResponse(
+      r => r.url().includes('publicdse_providersearch'),
+      { timeout: 8000 }
+    ).catch(() => {});
+    await page.waitForTimeout(500);
   }
-  await page.waitForTimeout(300);
-
-  // Step 3: Continue
-  const contBtn = page.locator('button:not(.ng-hide):has-text("Continue")').first();
-  if (await contBtn.count() > 0) {
-    await contBtn.click();
-  } else {
-    await page.evaluate(() => {
-      const btn = Array.from(document.querySelectorAll('button')).find(b =>
-        b.textContent?.includes('Continue') && !b.classList.contains('ng-hide') && b.offsetParent !== null
-      );
-      if (btn) btn.click();
-    });
-  }
-  await page.waitForURL('**/providerSearch**', { timeout: 15000 }).catch(() => {});
-  await page.waitForSelector('#Doctors, input[ng-model="criteria.typeAheadSearch"]', { timeout: 10000 }).catch(() => {});
 
   _h.page = page;
   _h.zip  = zip;
-  console.log(`[Aetna] Warm browser ready in ${Date.now() - t0}ms`);
+  console.log(`[Aetna] Warm ready in ${Date.now() - t0}ms | headers: ${_h.reqHeaders ? 'captured ✓' : 'MISSING ✗'}`);
   return page;
 }
 
 async function getWarmPage(zip) {
   if (_h.page && _h.zip === zip) {
-    try { if (!_h.page.isClosed()) { console.log('[Aetna] ♻️  Reusing warm page'); return _h.page; } }
-    catch {}
+    try { if (!_h.page.isClosed()) return _h.page; } catch {}
   }
-  if (_h.initPromise) { console.log('[Aetna] Waiting for browser init...'); return _h.initPromise; }
+  if (_h.initPromise) return _h.initPromise;
   _h.initPromise = initWarmPage(zip).finally(() => { _h.initPromise = null; });
   return _h.initPromise;
-}
-
-// ── Typeahead on warm page (captures headers as a side-effect) ────────────────
-async function searchNameTypeahead(name, zip, maxResults, page) {
-  const cap = Math.min(maxResults, 8);
-
-  const inp = page.locator('#Doctors, input[ng-model="criteria.typeAheadSearch"]').first();
-  await inp.waitFor({ timeout: 8000 });
-  await inp.click();
-  await page.waitForTimeout(100);
-  await page.keyboard.press('Control+a');
-  await page.keyboard.press('Delete');
-  await page.keyboard.type(name, { delay: 20 });
-  await page.waitForSelector('li.typeahead_grouping, .viewMore a', { timeout: 5000 }).catch(() => {});
-  await page.waitForTimeout(300);
-
-  // Click "More providers" if visible
-  const moreClicked = await page.evaluate(() => {
-    const a = document.querySelector('.viewMore a') ||
-      Array.from(document.querySelectorAll('a[ng-click*="clickViewMore"]')).find(e => e.offsetParent);
-    if (a && a.offsetParent) { a.click(); return a.textContent?.trim(); }
-    return null;
-  });
-  if (moreClicked) {
-    console.log('[Aetna] "More providers":', moreClicked);
-    await page.waitForSelector('li.typeahead_grouping', { timeout: 3000 }).catch(() => {});
-    await page.waitForTimeout(300);
-  }
-
-  const respPromise = page.waitForResponse(
-    res => res.url().includes('publicdse_providersearch'), { timeout: 35000 }
-  ).catch(() => null);
-
-  const clicked = await page.evaluate(n => {
-    const pat = new RegExp(n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\s*\\(any location\\)', 'i');
-    const all = [...document.querySelectorAll(
-      'li.typeahead_grouping, li[ng-repeat*="Filter"], .dropdown-menu li, li, a, span, div'
-    )];
-    const el = all.find(e => e.offsetParent !== null && pat.test(e.textContent || ''));
-    if (el) { el.click(); return el.textContent?.trim(); }
-    return null;
-  }, name);
-  console.log('[Aetna] Any-location click:', clicked);
-  if (!clicked) throw new Error('Could not click any-location option');
-
-  const resp = await respPromise;
-  if (!resp) throw new Error('No API response captured');
-  const body = await resp.text().catch(() => { throw new Error('Empty API response'); });
-  const parsed = parseAetnaBody(body);
-  console.log(`[Aetna] Typeahead → ${parsed.length} providers`);
-  return dedup(parsed).slice(0, cap);
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────
@@ -292,40 +255,48 @@ async function searchAetna({
   // ── Name search ─────────────────────────────────────────────────────────────
   if (isNameSearch) {
 
-    // 1. Fast path: direct https with cached auth headers (~3-5 s)
+    // 1. If we already have cached headers → direct https (~3-5s)
     if (_h.urlTemplate && _h.reqHeaders) {
       try {
-        const results = await searchFastHttps(name, zip, maxResults);
+        const results = await searchFastHttps(name, maxResults);
         console.log(`[Aetna] ⚡ Fast success: ${results.length} providers`);
         return results;
       } catch (e) {
-        console.log('[Aetna] Fast failed:', e.message, '— falling back to warm typeahead');
+        console.log('[Aetna] Fast path failed:', e.message);
+        // If auth expired, cache was already cleared — fall through to re-warm
+        // If other error, also fall through
       }
     }
 
-    // 2. Typeahead on warm page (first search, or after cache cleared)
-    let warmPage;
+    // 2. No cached headers yet (or expired) → warm browser, capture headers, then fast search
+    console.log('[Aetna] Warming browser to capture auth headers...');
     try {
-      warmPage = await getWarmPage(zip);
+      await getWarmPage(zip);
     } catch (e) {
-      console.log('[Aetna] Warm page init failed:', e.message, '— fresh browser');
-      warmPage = null;
+      console.log('[Aetna] Warm-up failed:', e.message);
     }
 
-    if (warmPage) {
+    if (_h.urlTemplate && _h.reqHeaders) {
       try {
-        const results = await searchNameTypeahead(name, zip, maxResults, warmPage);
-        console.log(`[Aetna] Warm typeahead success: ${results.length} providers`);
+        const results = await searchFastHttps(name, maxResults);
+        console.log(`[Aetna] ⚡ Fast success (after warm): ${results.length} providers`);
         return results;
       } catch (e) {
-        console.log('[Aetna] Warm typeahead failed:', e.message, '— invalidating warm page');
-        _h.page = null; _h.zip = null;
-        // fall through to fresh browser
+        console.log('[Aetna] Fast search failed after warm:', e.message);
       }
     }
+
+    // 3. Last resort: use a fresh browser + typeahead click
+    console.log('[Aetna] Falling back to full typeahead...');
+    return searchAetnaFreshBrowserTypeahead(name, zip, maxResults);
   }
 
-  // ── Fresh browser (specialty, or name double-fallback) ────────────────────
+  // ── Specialty search (always fresh browser) ──────────────────────────────
+  return searchAetnaSpecialty(specialty, zip, maxResults);
+}
+
+// ── Last-resort: fresh browser with typeahead (name search) ──────────────────
+async function searchAetnaFreshBrowserTypeahead(name, zip, maxResults) {
   const browser = await chromium.launch({ headless: true, args: BROWSER_ARGS });
   try {
     const page = await browser.newPage();
@@ -340,116 +311,142 @@ async function searchAetna({
       if (/google-analytics|googletagmanager|doubleclick|adobe|omniture|mbox/i.test(u)) return route.abort();
       return route.continue();
     });
+
+    // Capture headers from this fresh browser too
+    page.on('request', req => {
+      if (req.url().includes('publicdse_providersearch')) {
+        _h.urlTemplate = req.url();
+        _h.reqHeaders  = req.headers();
+        console.log('[Aetna] ✓ Auth headers captured (fresh browser)');
+      }
+    });
+
     let capturedBody = null;
     page.on('response', async res => {
       if (res.url().includes('publicdse_providersearch'))
         try { capturedBody = await res.text(); } catch {}
     });
-    // Capture headers from fresh browser too (refreshes the cache)
+
+    await navigateToSearch(page, zip);
+
+    // Type name and wait for a response — AngularJS needs 3+ chars to fire the API
+    const inp = page.locator('#Doctors, input[ng-model="criteria.typeAheadSearch"]').first();
+    await inp.waitFor({ timeout: 8000 });
+    await inp.click();
+    // Type enough chars to trigger the typeahead (need ≥3 alphanumeric)
+    const typeQuery = name.length >= 3 ? name : name + 'aa';
+    await page.keyboard.type(typeQuery, { delay: 30 });
+
+    // Wait for ANY API response (typeahead results)
+    const resp = await page.waitForResponse(
+      r => r.url().includes('publicdse_providersearch'),
+      { timeout: 15000 }
+    ).catch(() => null);
+
+    if (resp) {
+      const body = await resp.text().catch(() => null);
+      if (body) capturedBody = body;
+    }
+
+    // Now try fast path (headers should be captured by now)
+    if (_h.urlTemplate && _h.reqHeaders) {
+      try {
+        const results = await searchFastHttps(name, maxResults);
+        // Promote this browser as the new warm page
+        if (_h.browser) { try { await _h.browser.close(); } catch {} }
+        _h.browser = browser; _h.page = page; _h.zip = zip;
+        return results;
+      } catch (e) {
+        console.log('[Aetna] Fast search failed in typeahead fallback:', e.message);
+      }
+    }
+
+    // Use the captured body directly if we have it
+    if (capturedBody) {
+      const parsed = parseAetnaBody(capturedBody);
+      if (parsed.length) return dedup(parsed).slice(0, Math.min(maxResults, 8));
+    }
+
+    throw new Error('Aetna: could not get results via any method');
+  } finally {
+    if (_h.browser !== browser) await browser.close().catch(() => {});
+  }
+}
+
+// ── Specialty search ──────────────────────────────────────────────────────────
+async function searchAetnaSpecialty(specialty, zip, maxResults) {
+  const browser = await chromium.launch({ headless: true, args: BROWSER_ARGS });
+  try {
+    const page = await browser.newPage();
+    await page.setViewportSize({ width: 900, height: 700 });
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    });
+    await page.route('**', route => {
+      const t = route.request().resourceType(), u = route.request().url();
+      if (['image','media','font'].includes(t)) return route.abort();
+      if (/google-analytics|googletagmanager|doubleclick|adobe|omniture|mbox/i.test(u)) return route.abort();
+      return route.continue();
+    });
+
+    let capturedBody = null;
+    page.on('response', async res => {
+      if (res.url().includes('publicdse_providersearch'))
+        try { capturedBody = await res.text(); } catch {}
+    });
+    // Refresh auth headers from specialty search too
     page.on('request', req => {
       if (req.url().includes('publicdse_providersearch')) {
         _h.urlTemplate = req.url();
         _h.reqHeaders  = req.headers();
-        console.log('[Aetna] ✓ Refreshed URL template + auth headers (fresh browser)');
       }
     });
 
-    // Navigate
-    await page.goto(
-      'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearchLanding&site_id=dse&language=en',
-      { waitUntil: 'domcontentloaded', timeout: 30000 }
-    );
-    await page.waitForSelector('#zip1', { timeout: 15000 });
-    await page.click('#zip1', { clickCount: 3 });
-    await page.type('#zip1', zip, { delay: 30 });
-    await page.evaluate(() => {
-      const el = document.querySelector('#zip1');
-      el?.dispatchEvent(new Event('input',  { bubbles: true }));
-      el?.dispatchEvent(new Event('change', { bubbles: true }));
-      el?.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-    });
-    await page.waitForTimeout(150);
-    await page.keyboard.press('Enter');
-    await page.waitForURL('**/providerSearchPlanList**', { timeout: 20000 }).catch(() => {});
-    if (!page.url().includes('providerSearchPlanList')) {
-      await page.locator('button:has-text("Search")').first().click().catch(() => {});
-      await page.waitForURL('**/providerSearchPlanList**', { timeout: 15000 }).catch(() => {});
-    }
-    await page.waitForSelector('label, input[type="radio"]', { timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(300);
-    const ppLabel = page.locator('label').filter({ hasText: 'Open Choice' }).first();
-    if (await ppLabel.count() > 0) { await ppLabel.click(); }
-    else { await page.locator('input[type="radio"][value*="MPPO"]').first().click().catch(() => {}); }
-    await page.waitForTimeout(300);
-    const cb = page.locator('button:not(.ng-hide):has-text("Continue")').first();
-    if (await cb.count() > 0) { await cb.click(); }
-    else {
-      await page.evaluate(() => {
-        const b = Array.from(document.querySelectorAll('button'))
-          .find(b => b.textContent?.includes('Continue') && !b.classList.contains('ng-hide') && b.offsetParent);
-        if (b) b.click();
-      });
-    }
-    await page.waitForURL('**/providerSearch**', { timeout: 15000 }).catch(() => {});
-    await page.waitForSelector('#Doctors, input[ng-model="criteria.typeAheadSearch"]', { timeout: 10000 }).catch(() => {});
+    await navigateToSearch(page, zip);
 
-    if (isNameSearch) {
-      const results = await searchNameTypeahead(name, zip, maxResults, page);
-      // Keep this fresh browser as the new warm page
-      if (_h.browser) { try { await _h.browser.close(); } catch {} }
-      _h.browser = browser; _h.page = page; _h.zip = zip;
-      return results;
-    }
-
-    // ── Specialty search ─────────────────────────────────────────────────────
+    // Navigate to Medical Specialists
     const medLink = page.locator('a, button, li').filter({ hasText: 'Medical Doctors' }).first();
-    if (await medLink.count() > 0) { await medLink.click(); }
-    else {
-      await page.evaluate(() => {
-        Array.from(document.querySelectorAll('a, button, li, span'))
-          .find(e => e.offsetParent && e.textContent?.includes('Medical Doctors'))?.click();
-      });
-    }
+    if (await medLink.count() > 0) await medLink.click();
+    else await page.evaluate(() => {
+      Array.from(document.querySelectorAll('a, button, li, span'))
+        .find(e => e.offsetParent && e.textContent?.includes('Medical Doctors'))?.click();
+    });
     await page.waitForURL('**/providerMedical**', { timeout: 15000 }).catch(() => {});
     await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
 
     const specLink = page.locator('a, button, li').filter({ hasText: 'Medical Specialists' }).first();
-    if (await specLink.count() > 0) { await specLink.click(); }
-    else {
-      await page.evaluate(() => {
-        Array.from(document.querySelectorAll('a, button, li, span'))
-          .find(e => e.offsetParent && e.textContent?.includes('Medical Specialists') && !e.textContent?.includes('All'))?.click();
-      });
-    }
+    if (await specLink.count() > 0) await specLink.click();
+    else await page.evaluate(() => {
+      Array.from(document.querySelectorAll('a, button, li, span'))
+        .find(e => e.offsetParent && e.textContent?.includes('Medical Specialists')
+          && !e.textContent?.includes('All'))?.click();
+    });
     await page.waitForURL('**/providerSearchSpecialists**', { timeout: 15000 }).catch(() => {});
     await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
     await page.waitForTimeout(800);
 
     const respP = page.waitForResponse(
-      res => res.url().includes('publicdse_providersearch'), { timeout: 25000 }
+      r => r.url().includes('publicdse_providersearch'), { timeout: 25000 }
     ).catch(() => null);
-    await page.evaluate(targetSpec => {
-      const all = Array.from(document.querySelectorAll('a, button, li, span, div[role="button"]'));
-      const exact   = all.find(e => e.offsetParent && e.textContent?.trim().toLowerCase() === targetSpec.toLowerCase());
-      if (exact)   { exact.click(); return; }
-      const partial = all.find(e => e.offsetParent && e.textContent?.toLowerCase().includes(targetSpec.toLowerCase()));
-      if (partial) { partial.click(); return; }
-      const allS    = all.find(e => e.offsetParent && e.textContent?.includes('All Medical Specialists'));
-      if (allS) allS.click();
+
+    await page.evaluate(sp => {
+      const all = [...document.querySelectorAll('a, button, li, span, div[role="button"]')];
+      const match = all.find(e => e.offsetParent && e.textContent?.trim().toLowerCase() === sp.toLowerCase())
+        || all.find(e => e.offsetParent && e.textContent?.toLowerCase().includes(sp.toLowerCase()))
+        || all.find(e => e.offsetParent && e.textContent?.includes('All Medical Specialists'));
+      if (match) match.click();
     }, specialty);
 
     await respP;
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
     await page.waitForTimeout(1000);
 
-    if (!capturedBody) throw new Error('Aetna: no API response captured');
+    if (!capturedBody) throw new Error('Aetna specialty: no API response captured');
     return parseAetnaBody(capturedBody).slice(0, maxResults);
 
   } finally {
-    // Only close if we didn't promote it to the warm page
-    if (_h.browser !== browser) {
-      await browser.close().catch(() => {});
-    }
+    await browser.close().catch(() => {});
   }
 }
 
