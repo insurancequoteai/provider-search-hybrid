@@ -18,15 +18,33 @@ async function searchAetna({ specialty = 'All Medical Specialists', name = '', z
   const isNameSearch = !!name;
   const browser = await chromium.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage', '--disable-gpu',
+      '--no-first-run', '--no-zygote',
+      '--disable-background-networking',
+      '--disable-default-apps', '--disable-sync',
+      '--disable-translate', '--mute-audio',
+      '--disable-extensions', '--disable-component-update',
+      '--safebrowsing-disable-auto-update',
+    ],
   });
 
   try {
     const page = await browser.newPage();
-    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.setViewportSize({ width: 900, height: 700 }); // smaller = less render work
     await page.setExtraHTTPHeaders({
       'Accept-Language': 'en-US,en;q=0.9',
       'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    });
+
+    // Block images, fonts, and analytics — we only need JS/CSS/XHR
+    await page.route('**', route => {
+      const type = route.request().resourceType();
+      const url  = route.request().url();
+      if (['image', 'media', 'font'].includes(type)) return route.abort();
+      if (/google-analytics|googletagmanager|doubleclick|adobe|omniture|mbox|adobe\.com\/b\/ss|aetnacdn\.com\/media/i.test(url)) return route.abort();
+      return route.continue();
     });
 
     let providerApiBody = null;
