@@ -118,15 +118,15 @@ async function searchViaAngular(name, zip, maxResults) {
     }, 25000);
     const handler = async (res) => {
       const url = res.url();
-      // Log any api01 response for diagnostics
+      // Log any non-pagecontent api01 response for diagnostics
       if (url.includes('api01') && url.includes('aetna')) {
         const ep = url.split('/').pop()?.split('?')[0] || '';
         if (ep && ep !== 'publicdse_pagecontent') {
           console.log('[Aetna] api01 response:', res.status(), ep, '|', url.substring(0, 120));
         }
       }
-      // Resolve on any provider search endpoint
-      if (!url.includes('providersearch') && !url.includes('publicdse_provider')) return;
+      // Only resolve on the actual provider SEARCH endpoint — NOT ratings, reviews, etc.
+      if (!url.includes('publicdse_providersearch')) return;
       clearTimeout(timeout);
       _h.page.off('response', handler);
       console.log('[Aetna] ✓ Provider search response:', res.status(), url.substring(0, 160));
@@ -328,9 +328,9 @@ async function initWarmPage(zip) {
       await page.waitForTimeout(200);
       // Press Enter to trigger actual provider search (typing alone only opens dropdown)
       await page.keyboard.press('Enter');
-      // Wait up to 12s for provider search response — will capture URL + auth if it comes through
+      // Wait up to 12s for actual provider SEARCH response (not ratings/reviews)
       await page.waitForResponse(
-        r => r.url().includes('providersearch') || r.url().includes('publicdse_provider'),
+        r => r.url().includes('publicdse_providersearch'),
         { timeout: 12000 }
       ).catch(() => console.log('[Aetna] No provider search response during warm-up (ok, will search on demand)'));
       await page.waitForTimeout(300);
