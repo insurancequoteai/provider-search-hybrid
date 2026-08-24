@@ -255,24 +255,25 @@ async function initWarmPage(zip) {
     return route.continue();
   });
 
-  // Capture auth headers from ANY api01.aetna.com/healthcore request
-  // (x-ibm-client-id is sent on every request — no search interaction needed)
+  // Capture auth headers ONLY from api01.aetna.com (prod) — NOT from api01.int.aetna.com.
+  // The int and prod environments use DIFFERENT x-ibm-client-id values.
+  // We call prod endpoints, so we need the prod client-id.
   page.on('request', req => {
     const url = req.url();
     if (!url.includes('api01.aetna.com') && !url.includes('healthcore')) return;
     const hdrs = req.headers();
-    console.log('[Aetna] API request:', url.substring(0, 200), '| auth keys:', Object.keys(hdrs).filter(k => /auth|ibm|key|token|secret/i.test(k)).join(','));
-    if (!_h.reqHeaders) {
+    const isProd = url.includes('api01.aetna.com') && !url.includes('int.aetna');
+    const authKeys = Object.keys(hdrs).filter(k => /auth|ibm|key|token|secret/i.test(k)).join(',');
+    console.log('[Aetna] API request:', url.substring(0, 180), '| prod:', isProd, '| auth keys:', authKeys);
+    if (!_h.reqHeaders && isProd) {
       _h.reqHeaders = hdrs;
-      console.log('[Aetna] ✓ Auth headers captured from:', url.substring(0, 120));
+      console.log('[Aetna] ✓ Auth headers captured (PROD) from:', url.substring(0, 120));
     }
-    // For apiBase, only trust the PUBLIC prod endpoint (api01.aetna.com, not int.aetna.com)
-    // — the int endpoint is private and not reachable from Railway's Node.js https.get()
-    if (!_h.apiBase && url.includes('api01.aetna.com') && !url.includes('int.aetna')) {
+    if (!_h.apiBase && isProd) {
       const m = url.match(/^(https:\/\/[^/]+\/healthcore\/[^/]+\/v\d+)/);
-      if (m) { _h.apiBase = m[1]; console.log('[Aetna] ✓ apiBase (prod):', _h.apiBase); }
+      if (m) { _h.apiBase = m[1]; console.log('[Aetna] ✓ apiBase:', _h.apiBase); }
     }
-    if (url.includes('publicdse_providersearch') && !url.includes('int.aetna') && !_h.urlTemplate) {
+    if (url.includes('publicdse_providersearch') && isProd && !_h.urlTemplate) {
       _h.urlTemplate = url;
       _h.reqHeaders  = hdrs;
       console.log('[Aetna] ✓ Search URL template captured');
@@ -431,19 +432,19 @@ async function searchAetnaFreshBrowserTypeahead(name, zip, maxResults) {
       return route.continue();
     });
 
-    // Capture headers from ANY api01.aetna.com request (typeahead or search)
+    // Capture headers ONLY from prod (api01.aetna.com) — int has a different x-ibm-client-id
     page.on('request', req => {
       const url = req.url();
       if (!url.includes('api01.aetna.com') && !url.includes('healthcore')) return;
       const hdrs = req.headers();
-      console.log('[Aetna] Fresh browser API req:', url.substring(0, 150), '| auth keys:', Object.keys(hdrs).filter(k => /auth|ibm|key|token|secret/i.test(k)).join(','));
-      if (!_h.reqHeaders) { _h.reqHeaders = hdrs; }
-      // Only use public prod endpoint for apiBase (int.aetna.com not reachable from Node.js)
-      if (!_h.apiBase && url.includes('api01.aetna.com') && !url.includes('int.aetna')) {
+      const isProd = url.includes('api01.aetna.com') && !url.includes('int.aetna');
+      console.log('[Aetna] Fresh browser API req:', url.substring(0, 150), '| prod:', isProd, '| auth:', Object.keys(hdrs).filter(k => /auth|ibm|key|token|secret/i.test(k)).join(','));
+      if (!_h.reqHeaders && isProd) { _h.reqHeaders = hdrs; }
+      if (!_h.apiBase && isProd) {
         const m = url.match(/^(https:\/\/[^/]+\/healthcore\/[^/]+\/v\d+)/);
         if (m) _h.apiBase = m[1];
       }
-      if (url.includes('publicdse_providersearch') && !url.includes('int.aetna') && !_h.urlTemplate) {
+      if (url.includes('publicdse_providersearch') && isProd && !_h.urlTemplate) {
         _h.urlTemplate = url; _h.reqHeaders = hdrs;
         console.log('[Aetna] ✓ Search URL template captured (fresh browser)');
       }
