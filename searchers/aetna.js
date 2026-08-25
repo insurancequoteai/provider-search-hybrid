@@ -539,24 +539,87 @@ async function searchAetna({
   }
 }
 
-// ── Map specialty string → ASA category tile text ────────────────────────────
-const CATEGORY_MAP = [
-  [['urgent care','emergency room','emergenc'],          'Urgent Care'],
-  [['walk-in','walk in','walkin'],                       'Walk-In Clinics'],
-  [['mental health','psychiatr','psycholog','behavioral','counseling','substance','eap'], 'Mental Health'],
-  [['hospital','medical center','skilled nursing','dialysis','surgery center','rehab'], 'Hospitals & Facilities'],
-  [['vision','optometrist','optician','contact lens','eye exam'],                       'Vision'],
-  [['lab','laboratory','bloodwork','imaging','radiology','diagnostic','sleep center','testing'], 'Labs & Testing'],
-  [['chiropractor','acupunct','massage','alternative','dietician','nutritionist'],      'Alternative Medicine'],
-  [['hearing aid','prosthetic','wheelchair','durable medical','dme','breast pump'],    'Durable Medical Equipment'],
+// ── Direct URL builder for specialty results ──────────────────────────────────
+// Navigate directly to providerResults hash — ZIP is preserved from warm-up session
+const ASA_RESULTS_BASE = 'https://www.aetna.com/dsepublic/#/contentPage?page=providerResults&site_id=asa&language=en&parameters=';
+
+// Map specialty keywords → ASA backend search parameters
+// Format: searchText (display) ; searchTextForBackEnd (internal_IOQDirect) ; isGuidedSearch=true
+const SPECIALTY_PARAMS = [
+  // Primary care
+  [['primary care','family medicine','family practice','family doctor','pcp'],
+    "searchText='Primary Care Provider (PCP)';searchTextForBackEnd='Primary Care Physician (PCP)_IOQDirect';isGuidedSearch=true"],
+  [['internal medicine','internist'],
+    "searchText='Internal Medicine';searchTextForBackEnd='Internal Medicine_IOQDirect';isGuidedSearch=true"],
+  [['pediatrician','pediatric','children'],
+    "searchText='Pediatrician';searchTextForBackEnd='Pediatrician_IOQDirect';isGuidedSearch=true"],
+  [['geriatrician','geriatric','elderly'],
+    "searchText='Geriatrician';searchTextForBackEnd='Geriatrician_IOQDirect';isGuidedSearch=true"],
+  // Specialists
+  [['cardiolog','heart'],
+    "searchText='Cardiologist';searchTextForBackEnd='Cardiologist_IOQDirect';isGuidedSearch=true"],
+  [['dermatolog','skin'],
+    "searchText='Dermatologist';searchTextForBackEnd='Dermatologist_IOQDirect';isGuidedSearch=true"],
+  [['neurolog','neurology'],
+    "searchText='Neurologist';searchTextForBackEnd='Neurologist_IOQDirect';isGuidedSearch=true"],
+  [['ob/gyn','obgyn','obstetric','gynecolog'],
+    "searchText='OB/GYN';searchTextForBackEnd='Obstetrics/Gynecology_IOQDirect';isGuidedSearch=true"],
+  [['oncolog','cancer'],
+    "searchText='Oncologist';searchTextForBackEnd='Oncologist_IOQDirect';isGuidedSearch=true"],
+  [['orthopedic','orthopedist','bone'],
+    "searchText='Orthopedic Surgeon';searchTextForBackEnd='Orthopedic Surgeon_IOQDirect';isGuidedSearch=true"],
+  [['ophthal','eye doctor','retina'],
+    "searchText='Ophthalmologist';searchTextForBackEnd='Ophthalmologist_IOQDirect';isGuidedSearch=true"],
+  [['endocrinolog','diabetes','thyroid','hormone'],
+    "searchText='Endocrinologist';searchTextForBackEnd='Endocrinologist_IOQDirect';isGuidedSearch=true"],
+  [['gastroenterolog','gi doctor','colonoscopy','digestive'],
+    "searchText='Gastroenterologist';searchTextForBackEnd='Gastroenterologist_IOQDirect';isGuidedSearch=true"],
+  [['pulmonolog','lung','respiratory'],
+    "searchText='Pulmonologist';searchTextForBackEnd='Pulmonologist_IOQDirect';isGuidedSearch=true"],
+  [['rheumatolog','arthritis','joints'],
+    "searchText='Rheumatologist';searchTextForBackEnd='Rheumatologist_IOQDirect';isGuidedSearch=true"],
+  [['urolog','kidney stone','bladder'],
+    "searchText='Urologist';searchTextForBackEnd='Urologist_IOQDirect';isGuidedSearch=true"],
+  [['nephrolog','kidney'],
+    "searchText='Nephrologist';searchTextForBackEnd='Nephrologist_IOQDirect';isGuidedSearch=true"],
+  [['allergist','allergy','immunolog'],
+    "searchText='Allergist/Immunologist';searchTextForBackEnd='Allergy/Immunology_IOQDirect';isGuidedSearch=true"],
+  [['physical therap','pt ','physiotherapy'],
+    "searchText='Physical Therapist';searchTextForBackEnd='Physical Therapist_IOQDirect';isGuidedSearch=true"],
+  [['podiatrist','foot doctor','podiatry'],
+    "searchText='Podiatrist';searchTextForBackEnd='Podiatrist_IOQDirect';isGuidedSearch=true"],
+  [['chiropractor','chiropractic'],
+    "searchText='Chiropractor';searchTextForBackEnd='Chiropractor_IOQDirect';isGuidedSearch=true"],
+  [['general surgeon','surgeon'],
+    "searchText='General Surgeon';searchTextForBackEnd='General Surgeon_IOQDirect';isGuidedSearch=true"],
+  // Mental health
+  [['psychiatr'],
+    "searchText='Psychiatrist';searchTextForBackEnd='Psychiatrist_IOQDirect';isGuidedSearch=true"],
+  [['psycholog','therapist','counselor','mental health','behavioral health'],
+    "searchText='Mental Health';searchTextForBackEnd='Mental Health_IOQDirect';isGuidedSearch=true"],
+  // Facilities
+  [['urgent care','immediate care'],
+    "searchText='Urgent Care';isGuidedSearch=true"],
+  [['walk-in','walk in','walkin'],
+    "searchText='Walk-In Clinic';searchTextForBackEnd='Walk-In Clinic_IOQDirect';isGuidedSearch=true"],
+  [['hospital','medical center'],
+    "searchText='Hospital';searchTextForBackEnd='Hospital_IOQDirect';isGuidedSearch=true"],
+  [['optometrist','vision','glasses','contact lens'],
+    "searchText='Optometrist';searchTextForBackEnd='Optometrist_IOQDirect';isGuidedSearch=true"],
+  [['lab','laboratory','bloodwork','testing','diagnostic imaging','radiology'],
+    "searchText='Lab/Testing';searchTextForBackEnd='Laboratory_IOQDirect';isGuidedSearch=true"],
 ];
 
-function getASACategory(specialty) {
+function buildSpecialtyURL(specialty) {
   const s = (specialty || '').toLowerCase();
-  for (const [keywords, tile] of CATEGORY_MAP) {
-    if (keywords.some(k => s.includes(k))) return tile;
+  for (const [keywords, params] of SPECIALTY_PARAMS) {
+    if (keywords.some(k => s.includes(k))) {
+      return ASA_RESULTS_BASE + encodeURIComponent(params);
+    }
   }
-  return 'Medical Doctors'; // default for any physician/specialist
+  // Generic fallback: try the specialty name as-is
+  const params = `searchText='${specialty}';searchTextForBackEnd='${specialty}_IOQDirect';isGuidedSearch=true`;
+  return ASA_RESULTS_BASE + encodeURIComponent(params);
 }
 
 // ── Scrape results page DOM for provider data ─────────────────────────────────
@@ -607,59 +670,30 @@ async function scrapeSpecialtyResultsPage(page) {
 
 // ── Specialty search ──────────────────────────────────────────────────────────
 async function searchBySpecialty(page, specialty, zip, maxResults) {
-  const onCat = await isOnCategoryPage(page);
-  if (!onCat) await navigateToASACategory(page, zip);
+  const directURL = buildSpecialtyURL(specialty);
+  console.log(`[Aetna] Specialty "${specialty}" → ${directURL.substring(0, 120)}`);
 
-  const category = getASACategory(specialty);
-  console.log(`[Aetna] Specialty "${specialty}" → tile "${category}"`);
+  // Set up API listener in case it fires
+  const apiPromise = makeBroadListener(page, 25000);
 
-  // Set up API listener in parallel (bonus if it fires)
-  const apiPromise = makeBroadListener(page, 30000);
+  // Navigate directly to the results hash — ZIP context is retained from warm-up
+  await page.goto(directURL, { waitUntil: 'domcontentloaded', timeout: 25000 });
+  await page.waitForLoadState('networkidle', { timeout: 20000 })
+    .catch(() => console.log('[Aetna] networkidle timeout — proceeding'));
+  await page.waitForTimeout(800);
 
-  // Use Playwright locator for reliable Angular click
-  // Try the exact category first, then "Medical Doctors" as fallback
-  const tryLabels = [category, 'Medical Doctors'];
-  let clicked = false;
-  for (const label of tryLabels) {
-    const loc = page.locator(`a, h3, h4, button, [ng-click]`).filter({ hasText: label }).first();
-    if (await loc.count().catch(() => 0) > 0) {
-      await loc.click({ timeout: 5000 }).catch(() => {});
-      console.log(`[Aetna] Clicked tile: ${label}`);
-      clicked = true;
-      break;
-    }
-  }
-  if (!clicked) {
-    console.log('[Aetna] No tile found — pressing Enter');
-    await page.keyboard.press('Enter');
-  }
-
-  // Step 1: Wait for the category page text to DISAPPEAR (Angular routing started)
+  // Wait for provider links (»-terminated) to appear
   await page.waitForFunction(
-    () => !(document.body.textContent || '').includes('What do you want to search for'),
-    { timeout: 15000 }
-  ).catch(() => console.log('[Aetna] Category page still visible after 15s'));
-
-  // Step 2: Wait for provider links (end with " »") to appear in DOM
-  const hasProviders = await page.waitForFunction(
     () => Array.from(document.querySelectorAll('a')).some(a => {
       const t = (a.textContent || '').trim();
       return t.endsWith('»') && t.length > 5 && t.length < 150;
     }),
-    { timeout: 35000 }
-  ).catch(() => null);
+    { timeout: 12000 }
+  ).catch(() => console.log('[Aetna] Provider links did not appear within 12s'));
 
-  if (!hasProviders) {
-    console.log('[Aetna] Provider links never appeared — dumping body snippet');
-    const snippet = await page.evaluate(() =>
-      (document.body.textContent || '').replace(/\s+/g, ' ').substring(0, 500)
-    ).catch(() => '');
-    console.log('[Aetna] Page text:', snippet);
-  }
+  await page.waitForTimeout(400);
 
-  await page.waitForTimeout(600);
-
-  // Primary: scrape results from DOM
+  // Primary: scrape provider links from DOM
   const domProviders = await scrapeSpecialtyResultsPage(page);
   console.log(`[Aetna] DOM scrape found ${domProviders.length} providers`);
 
@@ -679,21 +713,35 @@ async function searchBySpecialty(page, specialty, zip, maxResults) {
       providerId: '',
       locationId: `dom|${p.name}|${p.city}`,
     }));
+    // Page is now on results, not category — next name search will re-navigate
+    _h.zip = null;
     return dedup(normalized).slice(0, maxResults);
   }
 
-  // Fallback: API body if it came in
+  // Debug: log what's on the page
+  const dbg = await page.evaluate(() => {
+    const txt = (document.body.textContent || '').replace(/\s+/g, ' ').substring(0, 500);
+    const links = Array.from(document.querySelectorAll('a')).filter(a => a.offsetParent)
+      .map(a => (a.textContent || '').trim().substring(0, 50)).slice(0, 10);
+    return { txt, links };
+  }).catch(() => ({ txt: '', links: [] }));
+  console.log('[Aetna] Page text:', dbg.txt);
+  console.log('[Aetna] Visible links:', JSON.stringify(dbg.links));
+
+  // Fallback: API body if it fired
   const body = await Promise.race([
     apiPromise,
-    new Promise(r => setTimeout(() => r(null), 5000)),
+    new Promise(r => setTimeout(() => r(null), 3000)),
   ]);
   if (body) {
     console.log('[Aetna] Using API body as fallback for specialty');
+    _h.zip = null;
     const all = parseAetnaBody(body);
     return dedup(all).slice(0, maxResults);
   }
 
-  throw new Error('No specialty results from DOM or API');
+  _h.zip = null;
+  throw new Error(`No specialty results from DOM or API for "${specialty}"`);
 }
 
 module.exports = searchAetna;
