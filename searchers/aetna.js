@@ -246,7 +246,7 @@ async function extractFromResultsPage(page) {
         }
       }
 
-      // Method 2: Look for ng-repeat provider cards and extract text
+      // Method 2: ng-repeat provider cards
       const cards = document.querySelectorAll(
         '[ng-repeat*="provider"], [ng-repeat*="Provider"], .provider-card, .provider-result'
       );
@@ -254,6 +254,27 @@ async function extractFromResultsPage(page) {
         const items = Array.from(cards).map(c => c.textContent?.trim()).filter(Boolean);
         console.log('[Aetna] Found', cards.length, 'provider card elements');
         return JSON.stringify({ typeaheadItems: items.slice(0, 20) });
+      }
+
+      // Method 3: Scan ALL <a> and <li> elements for "Name - City, ST" patterns
+      // The ASA results page renders each provider as a clickable link
+      const allEls = document.querySelectorAll('a, li, h2, h3, h4, span[class], div[class]');
+      const namePattern = /^(.{3,60})\s*-\s*([A-Za-z\s]+),\s*([A-Z]{2})$/;
+      const seen = new Set();
+      const found = [];
+      for (const el of allEls) {
+        if (!el.offsetParent) continue; // skip hidden
+        const txt = (el.textContent || '').trim().replace(/\s+/g, ' ');
+        if (txt.length < 5 || txt.length > 120) continue;
+        if (namePattern.test(txt) && !seen.has(txt)) {
+          seen.add(txt);
+          found.push(txt);
+          if (found.length >= 20) break;
+        }
+      }
+      if (found.length > 0) {
+        console.log('[Aetna] Found', found.length, 'provider entries via text scan:', JSON.stringify(found).substring(0, 200));
+        return JSON.stringify({ typeaheadItems: found });
       }
 
       return null;
@@ -518,34 +539,148 @@ async function searchAetna({
   }
 }
 
+// ── Map specialty string → ASA category tile text ────────────────────────────
+const CATEGORY_MAP = [
+  [['urgent care','emergency room','emergenc'],          'Urgent Care'],
+  [['walk-in','walk in','walkin'],                       'Walk-In Clinics'],
+  [['mental health','psychiatr','psycholog','behavioral','counseling','substance','eap'], 'Mental Health'],
+  [['hospital','medical center','skilled nursing','dialysis','surgery center','rehab'], 'Hospitals & Facilities'],
+  [['vision','optometrist','optician','contact lens','eye exam'],                       'Vision'],
+  [['lab','laboratory','bloodwork','imaging','radiology','diagnostic','sleep center','testing'], 'Labs & Testing'],
+  [['chiropractor','acupunct','massage','alternative','dietician','nutritionist'],      'Alternative Medicine'],
+  [['hearing aid','prosthetic','wheelchair','durable medical','dme','breast pump'],    'Durable Medical Equipment'],
+];
+
+function getASACategory(specialty) {
+  const s = (specialty || '').toLowerCase();
+  for (const [keywords, tile] of CATEGORY_MAP) {
+    if (keywords.some(k => s.includes(k))) return tile;
+  }
+  return 'Medical Doctors'; // default for any physician/specialist
+}
+
+// ── Scrape results page DOM for provider data ─────────────────────────────────
+async function scrapeSpecialtyResultsPage(page) {
+  return page.evaluate(() => {
+    // Provider name links end with " »" on ASA results pages
+    const nameLinks = Array.from(document.querySelectorAll('a')).filter(a => {
+      const t = (a.textContent || '').trim();
+      return t.endsWith('»') && t.length > 5 && t.length < 120;
+    });
+
+    return nameLinks.slice(0, 30).map(link => {
+      const name = link.textContent.trim().replace(/\s*»\s*$/, '').trim();
+
+      // Walk up to find the row container
+      let row = link.closest('tr') || link.closest('td')?.parentElement;
+      if (!row) {
+        // Try generic container walk-up
+        let el = link.parentElement;
+        for (let i = 0; i < 6 && el; i++) {
+          const t = el.textContent || '';
+          if ((t.includes('miles') || t.includes('Specialties')) && t.includes('In Network')) { row = el; break; }
+          el = el.parentElement;
+        }
+      }
+
+      const rowText = row ? (row.textContent || '') : '';
+      const distMatch  = rowText.match(/(\d+\.\d+)\s*miles?/);
+      const phoneMatch = rowText.match(/\(?(\d{3})\)?[\s.-](\d{3})[\s.-](\d{4})/);
+      const specMatch  = rowText.match(/Specialties?:\s*([^\n]{3,120})/i);
+      const streetMatch= rowText.match(/(\d+\s+[A-Z][a-zA-Z0-9\s]+(?:St|Ave|Blvd|Dr|Ln|Rd|Way|Pkwy|Fwy|Hwy|NW|NE|SW|SE|Ste)[^,\n]{0,30})/i);
+      const cityMatch  = rowText.match(/([A-Za-z\s]{2,30}),\s*([A-Z]{2})\s+(\d{5})/);
+
+      return {
+        name,
+        inNetwork: rowText.includes('In Network'),
+        distance:  distMatch  ? parseFloat(distMatch[1]) : null,
+        phone:     phoneMatch ? `(${phoneMatch[1]}) ${phoneMatch[2]}-${phoneMatch[3]}` : '',
+        specialty: specMatch  ? specMatch[1].replace(/;.*/, '').trim().substring(0, 80) : '',
+        street:    streetMatch? streetMatch[0].trim() : '',
+        city:      cityMatch  ? cityMatch[1].trim() : '',
+        state:     cityMatch  ? cityMatch[2] : '',
+        zip:       cityMatch  ? cityMatch[3] : '',
+      };
+    }).filter(p => p.name && p.name.length > 3);
+  });
+}
+
 // ── Specialty search ──────────────────────────────────────────────────────────
 async function searchBySpecialty(page, specialty, zip, maxResults) {
   const onCat = await isOnCategoryPage(page);
   if (!onCat) await navigateToASACategory(page, zip);
 
-  const apiPromise = makeBroadListener(page, 30000);
+  const category = getASACategory(specialty);
+  console.log(`[Aetna] Specialty "${specialty}" → tile "${category}"`);
 
-  await page.evaluate(() => {
-    const els = document.querySelectorAll('a, button, h3, h4, div[ng-click]');
+  // Set up API listener in parallel (bonus if it fires)
+  const apiPromise = makeBroadListener(page, 18000);
+
+  // Click the matching category tile
+  const clicked = await page.evaluate((cat) => {
+    const els = Array.from(document.querySelectorAll('a, button, h3, h4, div[ng-click], [class*="tile"]'));
     for (const el of els) {
-      if (el.textContent?.includes('Medical Doctors') && el.offsetParent) {
+      if (el.offsetParent && (el.textContent || '').includes(cat)) {
         el.click();
-        return;
+        return (el.textContent || '').trim().substring(0, 60);
       }
     }
-  });
+    // Fallback: click Medical Doctors
+    for (const el of els) {
+      if (el.offsetParent && (el.textContent || '').includes('Medical Doctors')) {
+        el.click();
+        return 'Medical Doctors (fallback)';
+      }
+    }
+    return null;
+  }, category);
 
-  const body = await apiPromise;
-  if (!body) throw new Error('No API response from specialty search');
+  console.log('[Aetna] Tile clicked:', clicked);
 
-  const all = parseAetnaBody(body);
-  const specLower = specialty.toLowerCase();
-  const filtered = all.filter(p =>
-    p.specialty.toLowerCase().includes(specLower) ||
-    p.providerType.toLowerCase().includes(specLower) ||
-    specLower.includes('all')
-  );
-  return dedup(filtered.length ? filtered : all).slice(0, maxResults);
+  // Wait for results page to appear
+  await page.waitForFunction(
+    () => (document.body.textContent || '').includes('Provider/Facility Information') ||
+          (document.body.textContent || '').includes('In network search results') ||
+          (document.body.textContent || '').includes('Start New Search'),
+    { timeout: 20000 }
+  ).catch(() => console.log('[Aetna] Results page timeout — attempting DOM scrape anyway'));
+
+  await page.waitForTimeout(800);
+
+  // Primary: scrape results from DOM (no API needed)
+  const domProviders = await scrapeSpecialtyResultsPage(page);
+  console.log(`[Aetna] DOM scrape found ${domProviders.length} providers`);
+
+  if (domProviders.length > 0) {
+    const normalized = domProviders.map(p => ({
+      network:  NETWORK_NAME,
+      name:     p.name,
+      npi:      '',
+      providerType: '',
+      specialty: p.specialty,
+      address:  { street: p.street, city: p.city, state: p.state, zip: p.zip },
+      phone:    p.phone,
+      distance: p.distance,
+      acceptingNewPatients: false,
+      virtualVisits: false,
+      inNetwork: p.inNetwork,
+      providerId: '',
+      locationId: `dom|${p.name}|${p.city}`,
+    }));
+    return dedup(normalized).slice(0, maxResults);
+  }
+
+  // Fallback: API body if it came in
+  const body = await Promise.race([
+    apiPromise,
+    new Promise(r => setTimeout(() => r(null), 3000)),
+  ]);
+  if (body) {
+    const all = parseAetnaBody(body);
+    return dedup(all).slice(0, maxResults);
+  }
+
+  throw new Error('No specialty results from DOM or API');
 }
 
 module.exports = searchAetna;
