@@ -1,27 +1,28 @@
 // searchers/aetna.js
 //
-// Strategy:
-//   Warm-up (once, ~50s): browser navigates to providerSearch, types one char → captures
-//                          auth headers from the intercepted API request
-//   Name search  (3-5s) : direct https.get() with cached URL template + auth headers
-//   Token expired       : clear cache → re-warm automatically
-//   Specialty search    : fresh browser (navigates to different sub-page)
+// ASA (Aetna Signature Administrators) flow:
+//   1. Navigate to ASA landing → enter ZIP → Search → lands on category page
+//   2. Type doctor name in search box → typeahead appears with multiple results
+//   3. Click "X more Healthcare Providers & Practices »" link → full results page
+//   4. Capture publicdse_providersearch API response (multiple providers)
+//   5. Filter by name client-side and return
 //
-const https = require('https');
+//   Warm page stays on the category page between searches.
+//   Subsequent searches just type + click → ~3-8s
+//
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
 
-// ── Module-level auth cache ───────────────────────────────────────────────────
+const ASA_URL       = 'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearch&site_id=asa&language=en';
+const NETWORK_NAME  = 'Aetna Signature Administrators';
+
+// ── Module-level warm-page cache ──────────────────────────────────────────────
 const _h = {
-  urlTemplate   : null,   // full API URL captured from AngularJS request
-  reqHeaders    : null,   // all request headers (incl. x-ibm-client-id)
-  apiBase       : null,   // e.g. 'https://api01.aetna.com/healthcore/prod/v3'
-  searchPageUrl : null,   // URL of the providerSearch page (for fast re-navigation)
-  browser       : null,   // warm browser kept alive between Railway requests
-  page          : null,
-  zip           : null,
-  initPromise   : null,
+  browser     : null,
+  page        : null,
+  zip         : null,
+  initPromise : null,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -34,35 +35,34 @@ function parseAetnaBody(body) {
     const data = JSON.parse(body);
     const raw  = data?.providersResponse?.readProvidersResponse?.providerInfoResponses;
     const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
-    if (!list.length) console.log('[Aetna] parseBody: empty, prefix:', body.slice(0, 200));
+    if (!list.length) console.log('[Aetna] parseBody: empty. prefix:', body.slice(0, 200));
     return list.map(p => {
       const info   = p.providerInformation || {};
       const locRaw = p.providerLocations;
       const loc    = Array.isArray(locRaw) ? locRaw[0] : (locRaw || {});
-      const addr   = loc.address   || {};
-      const cont   = loc.contacts  || {};
+      const addr   = loc.address  || {};
+      const cont   = loc.contacts || {};
       let spec = '';
       const sp = p.providerSpecialties;
       if (Array.isArray(sp)) spec = sp[0]?.specialty?.description || '';
       else if (sp?.specialty) spec = sp.specialty.description || '';
-      spec = decodeHtml(spec);
       const desigs = Array.isArray(p.providerDesignations)
         ? p.providerDesignations
         : p.providerDesignations ? [p.providerDesignations] : [];
       return {
-        network: 'Aetna Open Choice PPO',
+        network: NETWORK_NAME,
         name:    decodeHtml(info.providerDisplayName?.full || ''),
         npi:     info.primaryNPI?.nationalProviderId || '',
         providerType: info.type || '',
-        specialty: spec,
+        specialty: decodeHtml(spec),
         address: {
-          street: decodeHtml(addr.streetLine1   || ''),
-          city:   decodeHtml(addr.city          || ''),
+          street: decodeHtml(addr.streetLine1 || ''),
+          city:   decodeHtml(addr.city        || ''),
           state:  addr.state      || '',
           zip:    addr.postalCode || '',
         },
-        phone:    cont.phonesVoice?.number || p.contacts?.primaryPhone?.number || '',
-        distance: parseFloat(addr.distance)  || null,
+        phone:    cont.phonesVoice?.number || '',
+        distance: parseFloat(addr.distance) || null,
         acceptingNewPatients: loc.acceptsNewPatients === 'Y',
         virtualVisits: desigs.some(d => ['TELEMED','VIDCONF'].includes(d.code)),
         inNetwork: true,
@@ -81,16 +81,15 @@ function dedup(providers) {
   });
 }
 
-function httpsGet(url, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers }, res => {
-      let body = '';
-      res.on('data', c => body += c);
-      res.on('end', () => resolve({ status: res.statusCode, body }));
-    });
-    req.on('error', reject);
-    req.setTimeout(20000, () => { req.destroy(); reject(new Error('https timeout')); });
-  });
+function filterByName(providers, name) {
+  if (!name) return providers;
+  const words = name.toLowerCase().trim().split(/\s+/).filter(w => w.length > 1);
+  if (!words.length) return providers;
+  // All words match
+  let out = providers.filter(p => words.every(w => p.name.toLowerCase().includes(w)));
+  // Fall back to any word
+  if (!out.length) out = providers.filter(p => words.some(w => p.name.toLowerCase().includes(w)));
+  return out.length ? out : providers;
 }
 
 const BROWSER_ARGS = [
@@ -100,181 +99,248 @@ const BROWSER_ARGS = [
   '--disable-extensions','--disable-component-update','--safebrowsing-disable-auto-update',
 ];
 
-// ── Search by typing into the warm browser's search box and capturing typeahead ─
-// Angular fires the right API request with correct auth/params automatically.
-// We listen for the response and capture it — no manual param guessing needed.
-async function searchViaAngular(name, zip, maxResults) {
-  if (!_h.page || _h.page.isClosed()) throw new Error('No warm page available');
-
-  console.log('[Aetna] ⚡ Type-and-capture search for:', name);
-
-  // Ensure we're on the search page (has the search input box)
-  const inp = _h.page.locator('#Doctors, input[ng-model="criteria.typeAheadSearch"]').first();
-  let inpCount = await inp.count().catch(() => 0);
-  console.log('[Aetna] Search input found:', inpCount > 0, '| page URL:', _h.page.url().substring(0, 100));
-
-  if (inpCount === 0) {
-    // Navigate directly back to search page — much faster than full flow (~5-10s vs ~50s)
-    const searchUrl = _h.searchPageUrl ||
-      'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearch&productIdentifier=~MPPO&siteId=dse&language=en';
-    console.log('[Aetna] Re-navigating to search page:', searchUrl.substring(0, 120));
-    await _h.page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(e =>
-      console.log('[Aetna] Navigation error:', e.message));
-    await _h.page.waitForSelector('#Doctors, input[ng-model="criteria.typeAheadSearch"]',
-      { timeout: 12000 }).catch(() => {});
-    inpCount = await inp.count().catch(() => 0);
-    if (inpCount === 0) throw new Error('Search input not found after re-navigation');
-  }
-
-  // Helper: make a promise that resolves with the first provider-containing API body
-  const makeProviderListener = (page, timeoutMs) => new Promise((resolve) => {
-    const t = setTimeout(() => { page.off('response', h); resolve(null); }, timeoutMs);
-    const h = async (res) => {
+// ── Listen for provider search API response ───────────────────────────────────
+function makeProviderListener(pg, timeoutMs) {
+  return new Promise(resolve => {
+    const t = setTimeout(() => { pg.off('response', h); resolve(null); }, timeoutMs);
+    const h = async res => {
       const url = res.url();
-      // Catch ANY aetna.com response — typeahead may not go to api01 specifically
-      if (!url.includes('aetna.com')) return;
-      if (/\.(js|css|png|jpg|gif|ico|svg|woff|ttf)(\?|$)/.test(url)) return;
-      const ep = url.split('/').pop()?.split('?')[0] || '';
-      if (ep === 'publicdse_pagecontent' || ep === 'publicdse_productcodes') return;
-      const status = res.status();
-      console.log('[Aetna] aetna.com response:', status, ep, '|', url.substring(0, 200));
-      if (status >= 400) return;
+      if (!url.includes('publicdse_providersearch')) return;
+      if (res.status() >= 400) {
+        console.log('[Aetna] API status', res.status(), 'on', url.substring(0, 150));
+        return;
+      }
       try {
         const body = await res.text();
-        if (!body || body.length < 100) return;
-        console.log('[Aetna] Body[' + ep + '] len=' + body.length + ' prefix:', body.substring(0, 120));
-        if ((body.includes('providerInfoResponses') || body.includes('providerDisplayName')) &&
-            !body.includes('"statusCode":"3000"') && !body.includes('"statusCode":3000')) {
-          clearTimeout(t);
-          page.off('response', h);
-          console.log('[Aetna] ✓ Provider data found in:', ep);
+        if (!body || !body.trimStart().startsWith('{')) return;
+        console.log('[Aetna] API body prefix:', body.substring(0, 160));
+        if (body.includes('"statusCode":"3000"')) {
+          console.log('[Aetna] ⚠ statusCode 3000 — will keep waiting');
+          return;
+        }
+        if (body.includes('providerInfoResponses') || body.includes('providerDisplayName')) {
+          clearTimeout(t); pg.off('response', h);
+          console.log('[Aetna] ✓ Provider JSON captured, len=', body.length);
           resolve(body);
         }
-      } catch(e) { console.log('[Aetna] Read error for', ep, ':', e.message); }
+      } catch(e) { console.log('[Aetna] Response read error:', e.message); }
     };
-    page.on('response', h);
+    pg.on('response', h);
   });
+}
 
-  // Phase 1: type name and wait up to 8s for any typeahead/search response
-  const typeaheadPromise = makeProviderListener(_h.page, 8000);
+// ── Step 1: Navigate ASA landing → enter ZIP → land on category page ──────────
+async function navigateToASACategory(page, zip) {
+  console.log('[Aetna] Loading ASA landing for ZIP', zip);
+  await page.goto(ASA_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForFunction(() => !!window.angular, { timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(700);
 
-  await inp.click({ clickCount: 3 });
-  await _h.page.waitForTimeout(80);
-  // Use keyboard to clear + type so Angular's input watchers fire properly
-  await _h.page.keyboard.press('Control+a');
-  await _h.page.keyboard.press('Delete');
-  const query = name.length >= 3 ? name.substring(0, 25) : name + ' aa';
-  await inp.type(query, { delay: 70 });
-  console.log('[Aetna] Typed:', query, '— waiting for typeahead response...');
+  // Landing page has input with placeholder "Enter location here"
+  const locInput = page.locator(
+    'input[placeholder*="location" i], input[placeholder*="zip" i], input[placeholder*="Enter" i], input[ng-model*="location"], input[ng-model*="zip"]'
+  ).first();
 
-  // Log Angular scope state right after typing (diagnostic)
-  const scopeInfo = await _h.page.evaluate(() => {
-    try {
-      const input = document.querySelector('#Doctors') ||
-                    document.querySelector('input[ng-model="criteria.typeAheadSearch"]');
-      if (!input) return 'no input';
-      const scope = window.angular?.element(input)?.scope?.();
-      if (!scope) return 'no scope';
-      const keys = Object.keys(scope).filter(k => !k.startsWith('$$'));
-      return 'val="' + (input.value || '') + '" criteriaKeys=' +
-             (scope.criteria ? Object.keys(scope.criteria).join(',') : 'none') +
-             ' scopeKeys=' + keys.slice(0, 15).join(',');
-    } catch(e) { return 'error: ' + e.message; }
-  });
-  console.log('[Aetna] Scope state after type:', scopeInfo);
+  const found = await locInput.count().catch(() => 0);
+  if (found > 0) {
+    await locInput.click({ clickCount: 3 });
+    await locInput.fill(zip);
+    await page.evaluate(() => {
+      const sel = 'input[placeholder*="location" i], input[placeholder*="zip" i], input[placeholder*="Enter" i]';
+      const el  = document.querySelector(sel);
+      if (el) {
+        el.dispatchEvent(new Event('input',  { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: '1' }));
+      }
+    });
+    await page.waitForTimeout(400);
+    console.log('[Aetna] ZIP', zip, 'entered');
+  } else {
+    // Debug: log all inputs
+    const inputs = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('input')).map(el => ({
+        id: el.id, placeholder: el.placeholder, ngModel: el.getAttribute('ng-model')
+      }))
+    );
+    console.log('[Aetna] ⚠ No location input. Inputs on page:', JSON.stringify(inputs));
+  }
 
-  let body = await typeaheadPromise;
+  // Click Search button
+  const searchBtn = page.locator('button:has-text("Search"), input[value="Search"], button[type="submit"]').first();
+  if (await searchBtn.count() > 0) {
+    await searchBtn.click();
+    console.log('[Aetna] Clicked Search');
+  } else {
+    await page.keyboard.press('Enter');
+    console.log('[Aetna] Pressed Enter to search');
+  }
 
-  // Phase 2: no typeahead data — press Enter to navigate to results page
-  if (!body) {
-    console.log('[Aetna] No typeahead data — pressing Enter for results page search...');
-    const resultsPromise = makeProviderListener(_h.page, 20000);
-    await _h.page.keyboard.press('Enter');
-    // Wait for navigation + results to load
-    await _h.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-    body = await resultsPromise;
-    if (body) {
-      console.log('[Aetna] Got provider data from results page search');
-      // Page has navigated; invalidate the search page cache
-      _h.searchPageUrl = null;
+  // Wait for category page — look for "What do you want to search for" text or the search input
+  await page.waitForFunction(
+    () => document.body.textContent?.includes('What do you want to search for') ||
+          document.body.textContent?.includes('search term') ||
+          document.body.textContent?.includes('Medical Doctors'),
+    { timeout: 18000 }
+  ).catch(() => console.log('[Aetna] Category page timeout — proceeding'));
+  await page.waitForTimeout(600);
+
+  console.log('[Aetna] Category page ready | URL:', page.url().substring(0, 120));
+  return true;
+}
+
+// ── Step 2: Type name → click "more results" link → capture API response ──────
+async function searchNameOnCategoryPage(page, name, zip) {
+  // Find the search box on the category page
+  // Screenshot shows: input placeholder "Start typing your search term..."
+  const searchSelectors = [
+    'input[placeholder*="search term" i]',
+    'input[placeholder*="Search" i]',
+    'input[ng-model*="typeAhead"]',
+    'input[ng-model*="search"]',
+    'input[ng-model*="Search"]',
+    'input[type="search"]',
+    'input[type="text"]',
+  ];
+
+  let searchInp = null;
+  for (const sel of searchSelectors) {
+    const el = page.locator(sel).first();
+    if (await el.count().catch(() => 0) > 0) {
+      searchInp = el;
+      console.log('[Aetna] Search input found via:', sel);
+      break;
     }
   }
 
-  if (!body) throw new Error('No provider data from typeahead or results page in 28s');
-
-  const parsed = parseAetnaBody(body);
-  if (!parsed.length) throw new Error(`0 providers in response (body: ${body.substring(0, 200)})`);
-  return dedup(parsed).slice(0, Math.min(maxResults, 8));
-}
-
-// ── Navigate browser to providerSearch page ───────────────────────────────────
-async function navigateToSearch(page, zip) {
-  // Step 1: landing
-  await page.goto(
-    'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearchLanding&site_id=dse&language=en',
-    { waitUntil: 'domcontentloaded', timeout: 30000 }
-  );
-  await page.waitForSelector('#zip1', { timeout: 15000 });
-  await page.click('#zip1', { clickCount: 3 });
-  await page.type('#zip1', zip, { delay: 30 });
-  await page.evaluate(() => {
-    const el = document.querySelector('#zip1');
-    el?.dispatchEvent(new Event('input',  { bubbles: true }));
-    el?.dispatchEvent(new Event('change', { bubbles: true }));
-    el?.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-  });
-  await page.waitForTimeout(150);
-  await page.keyboard.press('Enter');
-  await page.waitForURL('**/providerSearchPlanList**', { timeout: 20000 }).catch(() => {});
-  if (!page.url().includes('providerSearchPlanList')) {
-    await page.locator('button:has-text("Search")').first().click().catch(() => {});
-    await page.waitForURL('**/providerSearchPlanList**', { timeout: 15000 }).catch(() => {});
+  if (!searchInp) {
+    // Log what's on page
+    const html = await page.evaluate(() => document.body.innerHTML.substring(0, 1000));
+    console.log('[Aetna] ⚠ No search input. Page snippet:', html.substring(0, 400));
+    throw new Error('No search input on category page');
   }
 
-  // Step 2: select Open Choice PPO
-  await page.waitForSelector('label, input[type="radio"]', { timeout: 8000 }).catch(() => {});
-  await page.waitForTimeout(300);
-  const ppLabel = page.locator('label').filter({ hasText: 'Open Choice' }).first();
-  if (await ppLabel.count() > 0) {
-    await ppLabel.click();
-  } else {
-    await page.locator('input[type="radio"][value*="MPPO"]').first().click().catch(() => {});
-  }
-  await page.waitForTimeout(300);
+  // Set up API listener BEFORE typing (responses arrive fast)
+  const apiPromise = makeProviderListener(page, 25000);
 
-  // Step 3: Continue
-  const contBtn = page.locator('button:not(.ng-hide):has-text("Continue")').first();
-  if (await contBtn.count() > 0) {
-    await contBtn.click();
+  // Type the doctor's name
+  await searchInp.click({ clickCount: 3 });
+  await searchInp.fill('');
+  const query = name.substring(0, 30);
+  await searchInp.type(query, { delay: 80 });
+  console.log('[Aetna] Typed:', query, '— waiting for typeahead dropdown...');
+
+  // Wait for typeahead dropdown to appear
+  // The dropdown has "Healthcare Providers & Practices" header and individual results
+  const typeaheadVisible = await page.waitForFunction(
+    () => {
+      const texts = ['Healthcare Providers', 'more Healthcare', 'any location'];
+      return texts.some(t => document.body.textContent?.includes(t));
+    },
+    { timeout: 10000 }
+  ).catch(() => null);
+
+  if (typeaheadVisible) {
+    console.log('[Aetna] Typeahead visible — looking for "more results" link');
+    await page.waitForTimeout(300); // let dropdown fully render
+
+    // Try to click "X more Healthcare Providers & Practices »" link first
+    const moreLink = page.locator(
+      'a:has-text("more Healthcare"), a:has-text("more health"), [href*="providerResults"][href*="more"]'
+    ).first();
+
+    if (await moreLink.count() > 0) {
+      await moreLink.click();
+      console.log('[Aetna] ✓ Clicked "more Healthcare Providers" link');
+    } else {
+      // Fall back: click "Smith (any location)" row — last item in typeahead
+      const anyLocClicked = await page.evaluate((q) => {
+        const allEls = document.querySelectorAll('li, a, div[ng-click], span[ng-click], [role="option"]');
+        for (const el of allEls) {
+          const txt = el.textContent?.trim() || '';
+          if (txt.includes('any location') || txt.toLowerCase().startsWith(q.toLowerCase() + ' (')) {
+            el.click();
+            return txt;
+          }
+        }
+        // Try clicking the "more" text if visible
+        for (const el of allEls) {
+          if (el.textContent?.includes('more Healthcare') || el.textContent?.includes('more health')) {
+            el.click();
+            return el.textContent?.trim();
+          }
+        }
+        return null;
+      }, query);
+
+      if (anyLocClicked) {
+        console.log('[Aetna] ✓ Clicked typeahead option:', anyLocClicked.substring(0, 60));
+      } else {
+        console.log('[Aetna] ⚠ No "more" link found. Pressing Enter...');
+        await page.keyboard.press('Enter');
+      }
+    }
   } else {
-    await page.evaluate(() => {
-      const b = Array.from(document.querySelectorAll('button'))
-        .find(b => b.textContent?.includes('Continue') && !b.classList.contains('ng-hide') && b.offsetParent);
-      if (b) b.click();
+    console.log('[Aetna] No typeahead visible — pressing Enter');
+    await page.keyboard.press('Enter');
+  }
+
+  // Wait for results page API
+  console.log('[Aetna] Waiting for results API...');
+  const body = await apiPromise;
+
+  if (!body) {
+    // Try extracting from DOM / Angular scope as fallback
+    console.log('[Aetna] No API body — trying Angular scope extraction');
+    await page.waitForTimeout(3000);
+    const scopeJson = await page.evaluate(() => {
+      try {
+        const candidates = [
+          ...document.querySelectorAll('#providerResults, [ng-controller*="Provider"], [ng-controller*="provider"]')
+        ];
+        for (const el of candidates) {
+          const scope = window.angular?.element(el)?.scope?.();
+          if (!scope) continue;
+          const ctrl = scope.ctrl || scope;
+          for (const k of Object.keys(ctrl).filter(k => !k.startsWith('$'))) {
+            const v = ctrl[k];
+            if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object') {
+              const keys = Object.keys(v[0]).join(',');
+              if (/provider|npi|location/i.test(keys)) {
+                return JSON.stringify({ providersResponse: { readProvidersResponse: { providerInfoResponses: v.slice(0, 50) } } });
+              }
+            }
+          }
+        }
+      } catch(e) {}
+      return null;
     });
+    if (scopeJson) {
+      console.log('[Aetna] ✓ Got providers from Angular scope');
+      return scopeJson;
+    }
   }
-  await page.waitForURL('**/providerSearch**', { timeout: 15000 }).catch(() => {});
-  await page.waitForSelector('#Doctors, input[ng-model="criteria.typeAheadSearch"]', { timeout: 10000 }).catch(() => {});
+
+  return body;
 }
 
-// ── Warm browser: navigate + type one char to capture auth headers ────────────
+// ── Warm browser: navigate to ASA category page for ZIP ──────────────────────
 async function initWarmPage(zip) {
-  console.log(`[Aetna] Warming browser for ZIP ${zip}...`);
   const t0 = Date.now();
+  console.log(`[Aetna] Warming browser for ZIP ${zip}...`);
 
-  // Safely close previous browser
   const old = _h.browser;
-  _h.browser = null; _h.page = null; _h.searchPageUrl = null;
+  _h.browser = null; _h.page = null; _h.zip = null;
   if (old) { try { await old.close(); } catch {} }
 
   const browser = await chromium.launch({ headless: true, args: BROWSER_ARGS });
   _h.browser = browser;
   browser.on('disconnected', () => {
-    if (_h.browser === browser) { _h.browser = null; _h.page = null; _h.zip = null; _h.searchPageUrl = null; }
+    if (_h.browser === browser) { _h.browser = null; _h.page = null; _h.zip = null; }
   });
 
   const page = await browser.newPage();
-  await page.setViewportSize({ width: 900, height: 700 });
+  await page.setViewportSize({ width: 1024, height: 768 });
   await page.setExtraHTTPHeaders({
     'Accept-Language': 'en-US,en;q=0.9',
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -286,67 +352,12 @@ async function initWarmPage(zip) {
     return route.continue();
   });
 
-  // Log ALL aetna API requests (both prod + int) to understand routing.
-  // Capture auth headers only from the prod host (api01.aetna.com, NOT api01.int.aetna.com).
-  page.on('request', req => {
-    const url = req.url();
-    if (!url.includes('aetna.com') || !url.includes('healthcore')) return;
-    const hdrs = req.headers();
-    const host = url.match(/https?:\/\/([^/]+)/)?.[1] || '';
-    const isProd = host === 'api01.aetna.com';
-    const endpoint = url.split('/').pop()?.split('?')[0] || '';
-    const authKeys = Object.keys(hdrs).filter(k => /auth|ibm|key|token|secret/i.test(k)).join(',');
-    console.log('[Aetna] API req:', endpoint, '| host:', host, '| prod:', isProd, '| auth:', authKeys || 'none');
-    if (!_h.reqHeaders && isProd) {
-      _h.reqHeaders = hdrs;
-      console.log('[Aetna] ✓ Auth headers captured (PROD) clientId:', hdrs['x-ibm-client-id']?.substring(0, 8) + '...');
-    }
-    if (!_h.apiBase && isProd) {
-      const m = url.match(/^(https:\/\/[^/]+\/healthcore\/[^/]+\/v\d+)/);
-      if (m) { _h.apiBase = m[1]; console.log('[Aetna] ✓ apiBase:', _h.apiBase); }
-    }
-    if (url.includes('publicdse_providersearch') && isProd && !_h.urlTemplate) {
-      _h.urlTemplate = url;
-      _h.reqHeaders  = hdrs;
-      console.log('[Aetna] ✓ Search URL template captured from PROD');
-    }
-  });
+  await navigateToASACategory(page, zip);
 
-  await navigateToSearch(page, zip);
-
-  // Trigger typeahead to confirm the search box works and capture any auth headers.
-  // IMPORTANT: Do NOT press Enter — that navigates to the results page and breaks
-  // subsequent searches. We stay on the search page so searchViaAngular can reuse it.
-  const inp = page.locator('#Doctors, input[ng-model="criteria.typeAheadSearch"]').first();
-  const inpCount = await inp.count().catch(() => 0);
-  console.log('[Aetna] Search input available after navigation:', inpCount > 0);
-
-  // Store the search page URL for fast re-navigation if we ever get navigated away
-  _h.searchPageUrl = page.url();
-  console.log('[Aetna] Search page URL stored:', _h.searchPageUrl);
-
-  if (inpCount > 0) {
-    try {
-      await inp.click();
-      await page.waitForTimeout(200);
-      await inp.fill('smith');
-      await page.waitForTimeout(600);
-      // Wait for any api01.aetna.com response (typeahead fires immediately when typing)
-      await page.waitForResponse(
-        r => r.url().includes('api01.aetna.com') && !r.url().includes('pagecontent') && !r.url().includes('productcodes'),
-        { timeout: 8000 }
-      ).catch(() => console.log('[Aetna] No typeahead response during warm-up (ok)'));
-      await page.waitForTimeout(200);
-    } catch (e) {
-      console.log('[Aetna] Warm-up typeahead error:', e.message);
-    }
-  } else {
-    console.log('[Aetna] ⚠ Search input NOT found after navigation — page may be in wrong state');
-  }
-
-  _h.page = page;
-  _h.zip  = zip;
-  console.log(`[Aetna] Warm ready in ${Date.now() - t0}ms | page: SET | headers: ${_h.reqHeaders ? 'captured ✓' : 'MISSING ✗'} | urlTemplate: ${_h.urlTemplate ? 'captured ✓' : 'n/a'}`);
+  _h.browser = browser;
+  _h.page    = page;
+  _h.zip     = zip;
+  console.log(`[Aetna] Warm done in ${Date.now() - t0}ms | page on category for ZIP ${zip}`);
   return page;
 }
 
@@ -359,250 +370,111 @@ async function getWarmPage(zip) {
   return _h.initPromise;
 }
 
-// ── Main export ───────────────────────────────────────────────────────────────
-// ── Direct HTTPS using ALL captured headers (cookies + x-ibm-client-id) ──────
-// After warm-up, _h.reqHeaders has every header the browser sent including session
-// cookies. Sending them all bypasses the WAF that blocked header-stripped requests.
-async function searchFastHttps(name, zip, maxResults) {
-  if (!_h.reqHeaders) throw new Error('No captured headers');
-
-  // Extract productIdentifier from the captured URL template (e.g. "~MPPO") —
-  // but DON'T copy the rest of the template params which are specific-provider-scoped
-  // (the warm-up search selects a typeahead suggestion, so the URL is for one exact provider).
-  // Build a clean general name-search URL instead.
-  let productId = '~MPPO';
-  if (_h.urlTemplate) {
-    try {
-      const t = new URL(_h.urlTemplate);
-      productId = t.searchParams.get('productIdentifier') || productId;
-    } catch {}
+// ── Ensure warm page is on the category page (not results) ───────────────────
+async function ensureCategoryPage(page, zip) {
+  const bodyText = await page.evaluate(() => document.body.textContent || '').catch(() => '');
+  const onCategory = bodyText.includes('What do you want to search for') ||
+                     bodyText.includes('search term') ||
+                     bodyText.includes('Medical Doctors');
+  if (onCategory) {
+    console.log('[Aetna] Already on category page ✓');
+    return;
   }
-  const base = _h.apiBase || 'https://api01.aetna.com/healthcore/prod/v3';
-  const u = new URL(base + '/publicdse_providersearch');
-  u.searchParams.set('searchText', name);
-  u.searchParams.set('productIdentifier', productId);
-  u.searchParams.set('postalCode', zip || '77041');
-  u.searchParams.set('language', 'en');
-  u.searchParams.set('siteId', 'dse');
-  u.searchParams.set('responseLanguagePreference', 'en');
-  u.searchParams.set('radius', '75');
-  u.searchParams.set('maxResultCount', '25');
-  u.searchParams.set('pageNum', '1');
-
-  // Send ALL captured headers — session cookie is the key WAF bypass
-  const hdrs = { ..._h.reqHeaders };
-  delete hdrs['content-length']; delete hdrs['transfer-encoding'];
-  delete hdrs['connection']; delete hdrs['host'];
-
-  console.log('[Aetna] ⚡ Direct HTTPS search:', u.toString().substring(0, 200));
-  const { status, body } = await httpsGet(u.toString(), hdrs);
-  console.log('[Aetna] Direct HTTPS status:', status, '| body:', body.substring(0, 120));
-  if (status !== 200) throw new Error(`HTTP ${status}`);
-  const parsed = parseAetnaBody(body);
-  if (!parsed.length) throw new Error(`0 providers (body: ${body.substring(0, 150)})`);
-  return dedup(parsed).slice(0, Math.min(maxResults, 8));
+  console.log('[Aetna] Not on category page — re-navigating...');
+  await navigateToASACategory(page, zip);
 }
 
+// ── Main export ───────────────────────────────────────────────────────────────
 async function searchAetna({
   specialty  = 'All Medical Specialists',
   name       = '',
   zip        = '77041',
   maxResults = 25,
 } = {}) {
-  const isNameSearch = !!name;
-
-  // ── Name search ─────────────────────────────────────────────────────────────
-  if (isNameSearch) {
-
-    // 1. Warm browser if we don't have a live page yet
-    if (!_h.page || !_h.reqHeaders) {
-      console.log('[Aetna] Warming browser...');
-      try { await getWarmPage(zip); } catch (e) { console.log('[Aetna] Warm-up failed:', e.message); }
-      console.log('[Aetna] Post-warm: page=', _h.page ? 'SET' : 'NULL', '| urlTemplate:', !!_h.urlTemplate, '| headers:', !!_h.reqHeaders);
-    }
-
-    // 2. Angular $http injection inside warm browser (~5-10s)
-    //    (Direct HTTPS removed — Aetna WAF always returns 403 from Node.js)
-    if (_h.page && !_h.page.isClosed()) {
-      try {
-        const results = await searchViaAngular(name, zip, maxResults);
-        console.log(`[Aetna] ⚡ Angular injection success: ${results.length} providers`);
-        return results;
-      } catch (e) {
-        console.log('[Aetna] Angular injection failed:', e.message);
-      }
-    }
-
-    // 3. Last resort: full fresh browser (~60s)
-    console.log('[Aetna] Falling back to full browser typeahead...');
-    return searchAetnaFreshBrowserTypeahead(name, zip, maxResults);
+  // Ensure warm page exists
+  let page;
+  try {
+    page = await getWarmPage(zip);
+  } catch (e) {
+    console.log('[Aetna] Warm-up error:', e.message);
+    throw new Error('Aetna warm-up failed: ' + e.message);
   }
 
-  // ── Specialty search (always fresh browser) ──────────────────────────────
-  return searchAetnaSpecialty(specialty, zip, maxResults);
-}
+  if (!name) {
+    // Specialty search: navigate to Medical Doctors category
+    return searchBySpecialty(page, specialty, zip, maxResults);
+  }
 
-// ── Last-resort: fresh browser with typeahead (name search) ──────────────────
-async function searchAetnaFreshBrowserTypeahead(name, zip, maxResults) {
-  const browser = await chromium.launch({ headless: true, args: BROWSER_ARGS });
+  // Name search
   try {
-    const page = await browser.newPage();
-    await page.setViewportSize({ width: 900, height: 700 });
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'en-US,en;q=0.9',
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    });
-    await page.route('**', route => {
-      const t = route.request().resourceType(), u = route.request().url();
-      if (['image','media','font'].includes(t)) return route.abort();
-      if (/google-analytics|googletagmanager|doubleclick|adobe|omniture|mbox/i.test(u)) return route.abort();
-      return route.continue();
-    });
+    // Make sure we're on the category page (not a previous results page)
+    await ensureCategoryPage(page, zip);
 
-    // Capture headers ONLY from prod (api01.aetna.com) — int has a different x-ibm-client-id
-    page.on('request', req => {
-      const url = req.url();
-      if (!url.includes('api01.aetna.com') && !url.includes('healthcore')) return;
-      const hdrs = req.headers();
-      const isProd = url.includes('api01.aetna.com') && !url.includes('int.aetna');
-      console.log('[Aetna] Fresh browser API req:', url.substring(0, 150), '| prod:', isProd, '| auth:', Object.keys(hdrs).filter(k => /auth|ibm|key|token|secret/i.test(k)).join(','));
-      if (!_h.reqHeaders && isProd) { _h.reqHeaders = hdrs; }
-      if (!_h.apiBase && isProd) {
-        const m = url.match(/^(https:\/\/[^/]+\/healthcore\/[^/]+\/v\d+)/);
-        if (m) _h.apiBase = m[1];
-      }
-      if (url.includes('publicdse_providersearch') && isProd && !_h.urlTemplate) {
-        _h.urlTemplate = url; _h.reqHeaders = hdrs;
-        console.log('[Aetna] ✓ Search URL template captured (fresh browser)');
-      }
-    });
+    const t0 = Date.now();
+    const body = await searchNameOnCategoryPage(page, name, zip);
+    console.log(`[Aetna] Name search took ${Date.now() - t0}ms | got body: ${!!body}`);
 
-    let capturedBody = null;
-    page.on('response', async res => {
-      const url = res.url();
-      if (url.includes('publicdse_providersearch') || url.includes('api01.aetna.com'))
-        try { capturedBody = await res.text(); } catch {}
-    });
+    if (!body) throw new Error('No provider data returned from ASA search');
 
-    await navigateToSearch(page, zip);
+    const all = parseAetnaBody(body);
+    if (!all.length) throw new Error(`0 providers parsed (body: ${body.substring(0, 200)})`);
 
-    // Type name and wait for a response — AngularJS needs 3+ chars to fire the API
-    const inp = page.locator('#Doctors, input[ng-model="criteria.typeAheadSearch"]').first();
-    await inp.waitFor({ timeout: 8000 });
-    await inp.click();
-    // Type enough chars to trigger the typeahead (need ≥3 alphanumeric)
-    const typeQuery = name.length >= 3 ? name : name + 'aa';
-    await page.keyboard.type(typeQuery, { delay: 30 });
+    const filtered = filterByName(all, name);
+    console.log(`[Aetna] ✓ ${all.length} total → ${filtered.length} match "${name}"`);
 
-    // Wait for ANY api01.aetna.com response (typeahead or search)
-    const resp = await page.waitForResponse(
-      r => r.url().includes('api01.aetna.com') || r.url().includes('healthcore'),
-      { timeout: 15000 }
-    ).catch(() => null);
+    // After getting results, we may be on results page — reset on next call
+    // Don't re-navigate now; ensureCategoryPage handles it next time
+    return dedup(filtered).slice(0, Math.min(maxResults, 10));
 
-    if (resp) {
-      const body = await resp.text().catch(() => null);
-      if (body) capturedBody = body;
-    }
-
-    // Promote this browser as the warm page, then try Angular search
-    if (_h.browser && _h.browser !== browser) { try { await _h.browser.close(); } catch {} }
-    _h.browser = browser; _h.page = page; _h.zip = zip;
+  } catch (e) {
+    console.log('[Aetna] Name search failed:', e.message);
+    // Re-warm from scratch and retry once
+    console.log('[Aetna] Re-warming and retrying...');
     try {
-      const results = await searchViaAngular(name, zip, maxResults);
-      console.log('[Aetna] Angular search succeeded in fresh browser fallback');
-      return results;
-    } catch (e) {
-      console.log('[Aetna] Angular search failed in fresh browser fallback:', e.message);
+      _h.page = null; _h.zip = null;
+      page = await initWarmPage(zip);
+      const body = await searchNameOnCategoryPage(page, name, zip);
+      if (!body) throw new Error('No body on retry');
+      const all = parseAetnaBody(body);
+      const filtered = filterByName(all, name);
+      return dedup(filtered).slice(0, Math.min(maxResults, 10));
+    } catch (e2) {
+      throw new Error('Aetna search failed after retry: ' + e2.message);
     }
-
-    // Use the captured body directly if we have it
-    if (capturedBody) {
-      const parsed = parseAetnaBody(capturedBody);
-      if (parsed.length) return dedup(parsed).slice(0, Math.min(maxResults, 8));
-    }
-
-    throw new Error('Aetna: could not get results via any method');
-  } finally {
-    if (_h.browser !== browser) await browser.close().catch(() => {});
   }
 }
 
-// ── Specialty search ──────────────────────────────────────────────────────────
-async function searchAetnaSpecialty(specialty, zip, maxResults) {
-  const browser = await chromium.launch({ headless: true, args: BROWSER_ARGS });
-  try {
-    const page = await browser.newPage();
-    await page.setViewportSize({ width: 900, height: 700 });
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'en-US,en;q=0.9',
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    });
-    await page.route('**', route => {
-      const t = route.request().resourceType(), u = route.request().url();
-      if (['image','media','font'].includes(t)) return route.abort();
-      if (/google-analytics|googletagmanager|doubleclick|adobe|omniture|mbox/i.test(u)) return route.abort();
-      return route.continue();
-    });
+// ── Specialty search via category tiles ──────────────────────────────────────
+async function searchBySpecialty(page, specialty, zip, maxResults) {
+  await ensureCategoryPage(page, zip);
 
-    let capturedBody = null;
-    page.on('response', async res => {
-      if (res.url().includes('publicdse_providersearch'))
-        try { capturedBody = await res.text(); } catch {}
-    });
-    // Refresh auth headers from specialty search too
-    page.on('request', req => {
-      if (req.url().includes('publicdse_providersearch')) {
-        _h.urlTemplate = req.url();
-        _h.reqHeaders  = req.headers();
+  const apiPromise = makeProviderListener(page, 30000);
+
+  // Click "Medical Doctors & Specialists" tile
+  const medDocsClicked = await page.evaluate(() => {
+    const els = document.querySelectorAll('a, button, div[ng-click], h3, h4');
+    for (const el of els) {
+      if (el.textContent?.includes('Medical Doctors') && el.offsetParent) {
+        el.click();
+        return true;
       }
-    });
+    }
+    return false;
+  });
+  console.log('[Aetna] Medical Doctors clicked:', medDocsClicked);
 
-    await navigateToSearch(page, zip);
+  const body = await apiPromise;
+  if (!body) throw new Error('No API response from specialty search');
 
-    // Navigate to Medical Specialists
-    const medLink = page.locator('a, button, li').filter({ hasText: 'Medical Doctors' }).first();
-    if (await medLink.count() > 0) await medLink.click();
-    else await page.evaluate(() => {
-      Array.from(document.querySelectorAll('a, button, li, span'))
-        .find(e => e.offsetParent && e.textContent?.includes('Medical Doctors'))?.click();
-    });
-    await page.waitForURL('**/providerMedical**', { timeout: 15000 }).catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-
-    const specLink = page.locator('a, button, li').filter({ hasText: 'Medical Specialists' }).first();
-    if (await specLink.count() > 0) await specLink.click();
-    else await page.evaluate(() => {
-      Array.from(document.querySelectorAll('a, button, li, span'))
-        .find(e => e.offsetParent && e.textContent?.includes('Medical Specialists')
-          && !e.textContent?.includes('All'))?.click();
-    });
-    await page.waitForURL('**/providerSearchSpecialists**', { timeout: 15000 }).catch(() => {});
-    await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-    await page.waitForTimeout(800);
-
-    const respP = page.waitForResponse(
-      r => r.url().includes('publicdse_providersearch'), { timeout: 25000 }
-    ).catch(() => null);
-
-    await page.evaluate(sp => {
-      const all = [...document.querySelectorAll('a, button, li, span, div[role="button"]')];
-      const match = all.find(e => e.offsetParent && e.textContent?.trim().toLowerCase() === sp.toLowerCase())
-        || all.find(e => e.offsetParent && e.textContent?.toLowerCase().includes(sp.toLowerCase()))
-        || all.find(e => e.offsetParent && e.textContent?.includes('All Medical Specialists'));
-      if (match) match.click();
-    }, specialty);
-
-    await respP;
-    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-    await page.waitForTimeout(1000);
-
-    if (!capturedBody) throw new Error('Aetna specialty: no API response captured');
-    return parseAetnaBody(capturedBody).slice(0, maxResults);
-
-  } finally {
-    await browser.close().catch(() => {});
-  }
+  const all = parseAetnaBody(body);
+  // Filter by specialty name
+  const specLower = specialty.toLowerCase();
+  const filtered = all.filter(p =>
+    p.specialty.toLowerCase().includes(specLower) ||
+    p.providerType.toLowerCase().includes(specLower) ||
+    specLower.includes('all')
+  );
+  return dedup(filtered.length ? filtered : all).slice(0, maxResults);
 }
 
 module.exports = searchAetna;
