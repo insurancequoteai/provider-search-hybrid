@@ -126,56 +126,81 @@ async function searchViaAngular(name, zip, maxResults) {
     if (inpCount === 0) throw new Error('Search input not found after re-navigation');
   }
 
-  // Set up listener for ANY api01.aetna.com response that contains provider data.
-  // We look for the typeahead/search response Angular fires automatically when you type.
-  const bodyPromise = new Promise((resolve) => {
-    const timeout = setTimeout(() => {
-      _h.page.off('response', handler);
-      console.log('[Aetna] Response timeout after 15s — no provider data received');
-      resolve(null);
-    }, 15000);
-
-    const handler = async (res) => {
+  // Helper: make a promise that resolves with the first provider-containing API body
+  const makeProviderListener = (page, timeoutMs) => new Promise((resolve) => {
+    const t = setTimeout(() => { page.off('response', h); resolve(null); }, timeoutMs);
+    const h = async (res) => {
       const url = res.url();
-      if (!url.includes('api01.aetna.com')) return;
+      // Catch ANY aetna.com response — typeahead may not go to api01 specifically
+      if (!url.includes('aetna.com')) return;
+      if (/\.(js|css|png|jpg|gif|ico|svg|woff|ttf)(\?|$)/.test(url)) return;
       const ep = url.split('/').pop()?.split('?')[0] || '';
-      // Skip noisy endpoints
-      if (['publicdse_pagecontent', 'publicdse_productcodes', 'publicdse_providerratings'].includes(ep)) return;
-
+      if (ep === 'publicdse_pagecontent' || ep === 'publicdse_productcodes') return;
       const status = res.status();
-      console.log('[Aetna] Response from endpoint:', ep, '| status:', status, '| url:', url.substring(0, 180));
+      console.log('[Aetna] aetna.com response:', status, ep, '|', url.substring(0, 200));
       if (status >= 400) return;
-
       try {
         const body = await res.text();
+        if (!body || body.length < 100) return;
         console.log('[Aetna] Body[' + ep + '] len=' + body.length + ' prefix:', body.substring(0, 120));
-        // Check for provider data (any format)
-        if (body.includes('providerInfoResponses') || body.includes('providerDisplayName')) {
-          // Make sure it's not a 3000 error
-          if (body.includes('"statusCode":"3000"') || body.includes('"statusCode":3000')) {
-            console.log('[Aetna] Skipping — got statusCode 3000 error from', ep);
-            return;
-          }
-          clearTimeout(timeout);
-          _h.page.off('response', handler);
-          console.log('[Aetna] ✓ Provider data found in endpoint:', ep);
+        if ((body.includes('providerInfoResponses') || body.includes('providerDisplayName')) &&
+            !body.includes('"statusCode":"3000"') && !body.includes('"statusCode":3000')) {
+          clearTimeout(t);
+          page.off('response', h);
+          console.log('[Aetna] ✓ Provider data found in:', ep);
           resolve(body);
         }
-      } catch(e) { console.log('[Aetna] Error reading', ep, ':', e.message); }
+      } catch(e) { console.log('[Aetna] Read error for', ep, ':', e.message); }
     };
-    _h.page.on('response', handler);
+    page.on('response', h);
   });
 
-  // Type name to trigger Angular's typeahead — Angular fires the API request automatically
-  await inp.click({ clickCount: 3 });
-  await _h.page.waitForTimeout(100);
-  await inp.fill('');
-  const query = name.length >= 3 ? name.substring(0, 25) : name + ' aa';
-  await inp.type(query, { delay: 60 });
-  console.log('[Aetna] Typed:', query, '— waiting for provider data...');
+  // Phase 1: type name and wait up to 8s for any typeahead/search response
+  const typeaheadPromise = makeProviderListener(_h.page, 8000);
 
-  const body = await bodyPromise;
-  if (!body) throw new Error('No provider data from typeahead in 15s');
+  await inp.click({ clickCount: 3 });
+  await _h.page.waitForTimeout(80);
+  // Use keyboard to clear + type so Angular's input watchers fire properly
+  await _h.page.keyboard.press('Control+a');
+  await _h.page.keyboard.press('Delete');
+  const query = name.length >= 3 ? name.substring(0, 25) : name + ' aa';
+  await inp.type(query, { delay: 70 });
+  console.log('[Aetna] Typed:', query, '— waiting for typeahead response...');
+
+  // Log Angular scope state right after typing (diagnostic)
+  const scopeInfo = await _h.page.evaluate(() => {
+    try {
+      const input = document.querySelector('#Doctors') ||
+                    document.querySelector('input[ng-model="criteria.typeAheadSearch"]');
+      if (!input) return 'no input';
+      const scope = window.angular?.element(input)?.scope?.();
+      if (!scope) return 'no scope';
+      const keys = Object.keys(scope).filter(k => !k.startsWith('$$'));
+      return 'val="' + (input.value || '') + '" criteriaKeys=' +
+             (scope.criteria ? Object.keys(scope.criteria).join(',') : 'none') +
+             ' scopeKeys=' + keys.slice(0, 15).join(',');
+    } catch(e) { return 'error: ' + e.message; }
+  });
+  console.log('[Aetna] Scope state after type:', scopeInfo);
+
+  let body = await typeaheadPromise;
+
+  // Phase 2: no typeahead data — press Enter to navigate to results page
+  if (!body) {
+    console.log('[Aetna] No typeahead data — pressing Enter for results page search...');
+    const resultsPromise = makeProviderListener(_h.page, 20000);
+    await _h.page.keyboard.press('Enter');
+    // Wait for navigation + results to load
+    await _h.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    body = await resultsPromise;
+    if (body) {
+      console.log('[Aetna] Got provider data from results page search');
+      // Page has navigated; invalidate the search page cache
+      _h.searchPageUrl = null;
+    }
+  }
+
+  if (!body) throw new Error('No provider data from typeahead or results page in 28s');
 
   const parsed = parseAetnaBody(body);
   if (!parsed.length) throw new Error(`0 providers in response (body: ${body.substring(0, 200)})`);
