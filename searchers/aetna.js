@@ -1,41 +1,33 @@
 // searchers/aetna.js
 //
 // ASA (Aetna Signature Administrators) flow:
-//   1. Navigate to ASA landing → enter ZIP → Search → lands on category page
-//   2. Type doctor name in search box → typeahead appears with multiple results
-//   3. Click "X more Healthcare Providers & Practices »" link → full results page
-//   4. Capture publicdse_providersearch API response (multiple providers)
-//   5. Filter by name client-side and return
-//
-//   Warm page stays on the category page between searches.
-//   Subsequent searches just type + click → ~3-8s
+//   1. Navigate to ASA landing → wait for input → enter ZIP → Search → category page
+//   2. Type doctor name → typeahead dropdown appears with multiple providers
+//   3. Click "X more Healthcare Providers" link → full results page
+//   4a. Capture publicdse_providersearch API response  (if it fires)
+//   4b. OR extract provider data from results page DOM / Angular scope
+//   4c. OR parse provider names directly from typeahead dropdown items
+//   5. Filter by name, dedup, return
 //
 const { chromium } = require('playwright-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 chromium.use(StealthPlugin());
 
-const ASA_URL       = 'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearch&site_id=asa&language=en';
-const NETWORK_NAME  = 'Aetna Signature Administrators';
+const ASA_URL      = 'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearch&site_id=asa&language=en';
+const NETWORK_NAME = 'Aetna Signature Administrators';
 
-// ── Module-level warm-page cache ──────────────────────────────────────────────
-const _h = {
-  browser     : null,
-  page        : null,
-  zip         : null,
-  initPromise : null,
-};
+// ── Warm-page cache ───────────────────────────────────────────────────────────
+const _h = { browser: null, page: null, zip: null, initPromise: null };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const decodeHtml = s => (s || '')
-  .replace(/&#38;/g, '&').replace(/&amp;/g, '&')
-  .replace(/&lt;/g,  '<').replace(/&gt;/g,  '>');
+  .replace(/&#38;/g,'&').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>');
 
 function parseAetnaBody(body) {
   try {
     const data = JSON.parse(body);
     const raw  = data?.providersResponse?.readProvidersResponse?.providerInfoResponses;
     const list = Array.isArray(raw) ? raw : raw ? [raw] : [];
-    if (!list.length) console.log('[Aetna] parseBody: empty. prefix:', body.slice(0, 200));
     return list.map(p => {
       const info   = p.providerInformation || {};
       const locRaw = p.providerLocations;
@@ -70,7 +62,7 @@ function parseAetnaBody(body) {
         locationId: loc.locationID  || '',
       };
     });
-  } catch (e) { console.log('[Aetna] parseBody error:', e.message); return []; }
+  } catch(e) { console.log('[Aetna] parseBody error:', e.message); return []; }
 }
 
 function dedup(providers) {
@@ -85,11 +77,40 @@ function filterByName(providers, name) {
   if (!name) return providers;
   const words = name.toLowerCase().trim().split(/\s+/).filter(w => w.length > 1);
   if (!words.length) return providers;
-  // All words match
   let out = providers.filter(p => words.every(w => p.name.toLowerCase().includes(w)));
-  // Fall back to any word
   if (!out.length) out = providers.filter(p => words.some(w => p.name.toLowerCase().includes(w)));
   return out.length ? out : providers;
+}
+
+// Parse "Ian Smith MD - Houston, TX" style entries from typeahead dropdown
+function parseTypeaheadText(items) {
+  return items.map(text => {
+    // Format: "Name Credential - City, ST" or "Name - City, ST"
+    const m = text.match(/^(.+?)\s*-\s*([^,]+),\s*([A-Z]{2})$/);
+    if (!m) return null;
+    const fullName = m[1].trim();
+    const city     = m[2].trim();
+    const state    = m[3];
+    // Extract credential from end of name (MD, DO, MA, MC, etc.)
+    const credMatch = fullName.match(/\s+(MD|DO|MA|MC|NP|PA|APRN|LSW|LCSW|DMD|DDS|DC|PT|OD|PMHNP|CNM)$/i);
+    const name      = credMatch ? fullName.slice(0, -credMatch[0].length).trim() : fullName;
+    const cred      = credMatch ? credMatch[1].toUpperCase() : '';
+    return {
+      network: NETWORK_NAME,
+      name: fullName,
+      npi: '',
+      providerType: cred ? 'Individual' : '',
+      specialty: cred,
+      address: { street: '', city, state, zip: '' },
+      phone: '',
+      distance: null,
+      acceptingNewPatients: false,
+      virtualVisits: false,
+      inNetwork: true,
+      providerId: '',
+      locationId: `typeahead|${fullName}|${city}|${state}`,
+    };
+  }).filter(Boolean);
 }
 
 const BROWSER_ARGS = [
@@ -99,235 +120,298 @@ const BROWSER_ARGS = [
   '--disable-extensions','--disable-component-update','--safebrowsing-disable-auto-update',
 ];
 
-// ── Listen for provider search API response ───────────────────────────────────
-function makeProviderListener(pg, timeoutMs) {
+// ── Broad listener: catches ANY aetna.com JSON response with provider data ────
+function makeBroadListener(pg, timeoutMs) {
   return new Promise(resolve => {
     const t = setTimeout(() => { pg.off('response', h); resolve(null); }, timeoutMs);
     const h = async res => {
       const url = res.url();
-      if (!url.includes('publicdse_providersearch')) return;
-      if (res.status() >= 400) {
-        console.log('[Aetna] API status', res.status(), 'on', url.substring(0, 150));
-        return;
-      }
+      if (!url.includes('aetna.com')) return;
+      if (/\.(js|css|png|jpg|gif|ico|svg|woff|ttf|html)(\?|$)/i.test(url)) return;
+      const status = res.status();
+      if (status >= 400) return;
       try {
         const body = await res.text();
-        if (!body || !body.trimStart().startsWith('{')) return;
-        console.log('[Aetna] API body prefix:', body.substring(0, 160));
-        if (body.includes('"statusCode":"3000"')) {
-          console.log('[Aetna] ⚠ statusCode 3000 — will keep waiting');
-          return;
-        }
+        if (!body || body.length < 100) return;
+        if (!body.trimStart().startsWith('{') && !body.trimStart().startsWith('[')) return;
+        const ep = url.split('/').pop()?.split('?')[0] || '';
+        console.log('[Aetna] Response:', status, ep, '| len:', body.length, '| prefix:', body.substring(0, 100));
+        if (body.includes('"statusCode":"3000"')) return; // skip errors
         if (body.includes('providerInfoResponses') || body.includes('providerDisplayName')) {
           clearTimeout(t); pg.off('response', h);
-          console.log('[Aetna] ✓ Provider JSON captured, len=', body.length);
+          console.log('[Aetna] ✓ Provider JSON from:', ep);
           resolve(body);
         }
-      } catch(e) { console.log('[Aetna] Response read error:', e.message); }
+      } catch(e) {}
     };
     pg.on('response', h);
   });
 }
 
-// ── Step 1: Navigate ASA landing → enter ZIP → land on category page ──────────
+// ── Navigate to ASA landing, enter ZIP, reach category page ──────────────────
 async function navigateToASACategory(page, zip) {
-  console.log('[Aetna] Loading ASA landing for ZIP', zip);
-  await page.goto(ASA_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForFunction(() => !!window.angular, { timeout: 15000 }).catch(() => {});
-  await page.waitForTimeout(700);
+  console.log('[Aetna] Navigating to ASA for ZIP', zip);
+  await page.goto(ASA_URL, { waitUntil: 'domcontentloaded', timeout: 35000 });
 
-  // Landing page has input with placeholder "Enter location here"
-  const locInput = page.locator(
-    'input[placeholder*="location" i], input[placeholder*="zip" i], input[placeholder*="Enter" i], input[ng-model*="location"], input[ng-model*="zip"]'
-  ).first();
+  // WAIT for the location input to actually appear (Angular needs time to boot)
+  const locSel = 'input[placeholder*="location" i], input[placeholder*="zip" i], input[placeholder*="Enter" i]';
+  console.log('[Aetna] Waiting for location input...');
+  await page.waitForSelector(locSel, { timeout: 20000 }).catch(e =>
+    console.log('[Aetna] Location input wait failed:', e.message)
+  );
+  await page.waitForTimeout(400);
 
-  const found = await locInput.count().catch(() => 0);
-  if (found > 0) {
-    await locInput.click({ clickCount: 3 });
-    await locInput.fill(zip);
-    await page.evaluate(() => {
-      const sel = 'input[placeholder*="location" i], input[placeholder*="zip" i], input[placeholder*="Enter" i]';
-      const el  = document.querySelector(sel);
+  const locEl = page.locator(locSel).first();
+  if (await locEl.count().catch(() => 0) > 0) {
+    await locEl.click({ clickCount: 3 });
+    await locEl.fill(zip);
+    await page.evaluate(s => {
+      const el = document.querySelector(s);
       if (el) {
         el.dispatchEvent(new Event('input',  { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
         el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: '1' }));
       }
-    });
-    await page.waitForTimeout(400);
+    }, locSel);
+    await page.waitForTimeout(350);
     console.log('[Aetna] ZIP', zip, 'entered');
   } else {
-    // Debug: log all inputs
     const inputs = await page.evaluate(() =>
       Array.from(document.querySelectorAll('input')).map(el => ({
-        id: el.id, placeholder: el.placeholder, ngModel: el.getAttribute('ng-model')
+        id: el.id, placeholder: el.placeholder, ng: el.getAttribute('ng-model')
       }))
     );
-    console.log('[Aetna] ⚠ No location input. Inputs on page:', JSON.stringify(inputs));
+    console.log('[Aetna] ⚠ No location input. Inputs:', JSON.stringify(inputs).substring(0, 300));
   }
 
-  // Click Search button
-  const searchBtn = page.locator('button:has-text("Search"), input[value="Search"], button[type="submit"]').first();
-  if (await searchBtn.count() > 0) {
+  // Click Search
+  const searchBtn = page.locator('button:has-text("Search"), button[type="submit"]').first();
+  if (await searchBtn.count().catch(() => 0) > 0) {
     await searchBtn.click();
     console.log('[Aetna] Clicked Search');
   } else {
     await page.keyboard.press('Enter');
-    console.log('[Aetna] Pressed Enter to search');
+    console.log('[Aetna] Enter pressed');
   }
 
-  // Wait for category page — look for "What do you want to search for" text or the search input
+  // Wait for category page ("What do you want to search for" or "search term")
   await page.waitForFunction(
     () => document.body.textContent?.includes('What do you want to search for') ||
           document.body.textContent?.includes('search term') ||
           document.body.textContent?.includes('Medical Doctors'),
-    { timeout: 18000 }
-  ).catch(() => console.log('[Aetna] Category page timeout — proceeding'));
-  await page.waitForTimeout(600);
+    { timeout: 20000 }
+  ).catch(() => console.log('[Aetna] Category page wait timed out — proceeding'));
 
-  console.log('[Aetna] Category page ready | URL:', page.url().substring(0, 120));
-  return true;
+  await page.waitForTimeout(500);
+  console.log('[Aetna] Category page URL:', page.url().substring(0, 120));
 }
 
-// ── Step 2: Type name → click "more results" link → capture API response ──────
+// ── Check if we're on the category page with a search box ────────────────────
+async function isOnCategoryPage(page) {
+  try {
+    const text = await page.evaluate(() => document.body.textContent || '');
+    return text.includes('What do you want to search for') ||
+           text.includes('search term') ||
+           text.includes('Medical Doctors');
+  } catch { return false; }
+}
+
+// ── Extract providers from the results page DOM / Angular scope ───────────────
+async function extractFromResultsPage(page) {
+  return page.evaluate(() => {
+    try {
+      // Method 1: Angular scope on results controller
+      const candidates = [
+        ...document.querySelectorAll(
+          '#providerResults, [ng-controller*="Provider"], [ng-controller*="provider"], ' +
+          '[ng-controller*="Result"], [ng-controller*="result"]'
+        )
+      ];
+      for (const el of candidates) {
+        const scope = window.angular?.element(el)?.scope?.();
+        if (!scope) continue;
+        const ctrl = scope.ctrl || scope;
+        const keys = Object.keys(ctrl).filter(k => !k.startsWith('$'));
+        for (const k of keys) {
+          const v = ctrl[k];
+          if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object') {
+            const fk = Object.keys(v[0]).join(',');
+            if (/provider|npi|location|specialty|address/i.test(fk)) {
+              console.log('[Aetna] Found scope data key:', k, 'len:', v.length);
+              return JSON.stringify({
+                providersResponse: { readProvidersResponse: { providerInfoResponses: v.slice(0, 50) } }
+              });
+            }
+          }
+        }
+      }
+
+      // Method 2: Look for ng-repeat provider cards and extract text
+      const cards = document.querySelectorAll(
+        '[ng-repeat*="provider"], [ng-repeat*="Provider"], .provider-card, .provider-result'
+      );
+      if (cards.length > 0) {
+        const items = Array.from(cards).map(c => c.textContent?.trim()).filter(Boolean);
+        console.log('[Aetna] Found', cards.length, 'provider card elements');
+        return JSON.stringify({ typeaheadItems: items.slice(0, 20) });
+      }
+
+      return null;
+    } catch(e) {
+      console.log('[Aetna] DOM extract error:', e.message);
+      return null;
+    }
+  });
+}
+
+// ── Extract names from typeahead dropdown ─────────────────────────────────────
+async function extractTypeaheadItems(page) {
+  return page.evaluate(() => {
+    try {
+      // Look for the typeahead dropdown list items
+      const listItems = document.querySelectorAll('li, [role="option"], .search-result, .result-item');
+      const texts = [];
+      for (const item of listItems) {
+        const t = item.textContent?.trim();
+        if (!t) continue;
+        if (t.includes('Can\'t find') || t.includes('Healthcare Providers') ||
+            t.includes('Traveling?') || t.includes('any location') ||
+            t.includes('more Healthcare') || t.length > 100) continue;
+        // Must look like "Name - City, ST"
+        if (t.includes(' - ') && /,\s*[A-Z]{2}$/.test(t)) {
+          texts.push(t);
+        }
+      }
+      return texts;
+    } catch(e) { return []; }
+  });
+}
+
+// ── Main name search on the category page ─────────────────────────────────────
 async function searchNameOnCategoryPage(page, name, zip) {
-  // Find the search box on the category page
-  // Screenshot shows: input placeholder "Start typing your search term..."
-  const searchSelectors = [
-    'input[placeholder*="search term" i]',
-    'input[placeholder*="Search" i]',
+  // Find the search box (screenshots show placeholder "Start typing your search term...")
+  const inputSels = [
     'input[ng-model*="typeAhead"]',
+    'input[ng-model*="typeahead"]',
     'input[ng-model*="search"]',
     'input[ng-model*="Search"]',
+    'input[placeholder*="search term" i]',
+    'input[placeholder*="Search" i]',
     'input[type="search"]',
-    'input[type="text"]',
   ];
 
   let searchInp = null;
-  for (const sel of searchSelectors) {
+  for (const sel of inputSels) {
     const el = page.locator(sel).first();
     if (await el.count().catch(() => 0) > 0) {
       searchInp = el;
-      console.log('[Aetna] Search input found via:', sel);
+      console.log('[Aetna] Search input via:', sel);
       break;
     }
   }
 
   if (!searchInp) {
-    // Log what's on page
-    const html = await page.evaluate(() => document.body.innerHTML.substring(0, 1000));
-    console.log('[Aetna] ⚠ No search input. Page snippet:', html.substring(0, 400));
-    throw new Error('No search input on category page');
+    const inputs = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('input')).map(el => ({
+        placeholder: el.placeholder, ng: el.getAttribute('ng-model')
+      }))
+    );
+    throw new Error('No search input on category page. Inputs: ' + JSON.stringify(inputs).substring(0, 200));
   }
 
-  // Set up API listener BEFORE typing (responses arrive fast)
-  const apiPromise = makeProviderListener(page, 25000);
+  // Set up broad API listener BEFORE typing
+  const apiPromise = makeBroadListener(page, 20000);
 
-  // Type the doctor's name
+  // Type the name
   await searchInp.click({ clickCount: 3 });
   await searchInp.fill('');
   const query = name.substring(0, 30);
   await searchInp.type(query, { delay: 80 });
-  console.log('[Aetna] Typed:', query, '— waiting for typeahead dropdown...');
+  console.log('[Aetna] Typed:', query);
 
-  // Wait for typeahead dropdown to appear
-  // The dropdown has "Healthcare Providers & Practices" header and individual results
-  const typeaheadVisible = await page.waitForFunction(
-    () => {
-      const texts = ['Healthcare Providers', 'more Healthcare', 'any location'];
-      return texts.some(t => document.body.textContent?.includes(t));
-    },
+  // Wait for typeahead dropdown
+  const typeaheadReady = await page.waitForFunction(
+    () => document.body.textContent?.includes('Healthcare Providers') ||
+          document.body.textContent?.includes('more Healthcare') ||
+          document.querySelectorAll('li').length > 3,
     { timeout: 10000 }
   ).catch(() => null);
 
-  if (typeaheadVisible) {
-    console.log('[Aetna] Typeahead visible — looking for "more results" link');
-    await page.waitForTimeout(300); // let dropdown fully render
+  if (!typeaheadReady) {
+    console.log('[Aetna] Typeahead did not appear — trying Enter');
+    await page.keyboard.press('Enter');
+    const body = await apiPromise;
+    return body;
+  }
 
-    // Try to click "X more Healthcare Providers & Practices »" link first
-    const moreLink = page.locator(
-      'a:has-text("more Healthcare"), a:has-text("more health"), [href*="providerResults"][href*="more"]'
-    ).first();
+  console.log('[Aetna] Typeahead visible ✓');
+  await page.waitForTimeout(400);
 
-    if (await moreLink.count() > 0) {
-      await moreLink.click();
-      console.log('[Aetna] ✓ Clicked "more Healthcare Providers" link');
-    } else {
-      // Fall back: click "Smith (any location)" row — last item in typeahead
-      const anyLocClicked = await page.evaluate((q) => {
-        const allEls = document.querySelectorAll('li, a, div[ng-click], span[ng-click], [role="option"]');
-        for (const el of allEls) {
-          const txt = el.textContent?.trim() || '';
-          if (txt.includes('any location') || txt.toLowerCase().startsWith(q.toLowerCase() + ' (')) {
-            el.click();
-            return txt;
-          }
-        }
-        // Try clicking the "more" text if visible
-        for (const el of allEls) {
-          if (el.textContent?.includes('more Healthcare') || el.textContent?.includes('more health')) {
-            el.click();
-            return el.textContent?.trim();
-          }
-        }
-        return null;
-      }, query);
+  // Scrape typeahead items RIGHT NOW as fallback (before clicking away)
+  const typeaheadItems = await extractTypeaheadItems(page);
+  console.log('[Aetna] Typeahead items:', typeaheadItems.length, JSON.stringify(typeaheadItems).substring(0, 200));
 
-      if (anyLocClicked) {
-        console.log('[Aetna] ✓ Clicked typeahead option:', anyLocClicked.substring(0, 60));
-      } else {
-        console.log('[Aetna] ⚠ No "more" link found. Pressing Enter...');
-        await page.keyboard.press('Enter');
+  // Try to click the "more Healthcare Providers" link
+  const moreClicked = await page.evaluate(() => {
+    const els = Array.from(document.querySelectorAll('a, button, span, li'));
+    for (const el of els) {
+      const txt = el.textContent?.trim() || '';
+      if (txt.includes('more Healthcare') || txt.includes('more health')) {
+        el.click();
+        return 'more:' + txt.substring(0, 60);
       }
     }
+    return null;
+  });
+
+  if (moreClicked) {
+    console.log('[Aetna] Clicked:', moreClicked);
   } else {
-    console.log('[Aetna] No typeahead visible — pressing Enter');
+    // Log all clickable elements for debugging, then press Enter
+    const clickables = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('a, button')).filter(e => e.offsetParent)
+        .map(e => e.textContent?.trim()).filter(t => t && t.length < 80)
+    );
+    console.log('[Aetna] No "more" link. Clickables:', JSON.stringify(clickables).substring(0, 300));
     await page.keyboard.press('Enter');
   }
 
-  // Wait for results page API
-  console.log('[Aetna] Waiting for results API...');
+  // Wait for API body up to 15s
   const body = await apiPromise;
-
-  if (!body) {
-    // Try extracting from DOM / Angular scope as fallback
-    console.log('[Aetna] No API body — trying Angular scope extraction');
-    await page.waitForTimeout(3000);
-    const scopeJson = await page.evaluate(() => {
-      try {
-        const candidates = [
-          ...document.querySelectorAll('#providerResults, [ng-controller*="Provider"], [ng-controller*="provider"]')
-        ];
-        for (const el of candidates) {
-          const scope = window.angular?.element(el)?.scope?.();
-          if (!scope) continue;
-          const ctrl = scope.ctrl || scope;
-          for (const k of Object.keys(ctrl).filter(k => !k.startsWith('$'))) {
-            const v = ctrl[k];
-            if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object') {
-              const keys = Object.keys(v[0]).join(',');
-              if (/provider|npi|location/i.test(keys)) {
-                return JSON.stringify({ providersResponse: { readProvidersResponse: { providerInfoResponses: v.slice(0, 50) } } });
-              }
-            }
-          }
-        }
-      } catch(e) {}
-      return null;
-    });
-    if (scopeJson) {
-      console.log('[Aetna] ✓ Got providers from Angular scope');
-      return scopeJson;
-    }
+  if (body) {
+    console.log('[Aetna] ✓ API body captured');
+    return { type: 'api', body };
   }
 
-  return body;
+  // No API body — try to extract from results page DOM
+  console.log('[Aetna] No API body — waiting for results DOM...');
+  await page.waitForTimeout(3000);
+
+  const domResult = await extractFromResultsPage(page);
+  if (domResult) {
+    try {
+      const parsed = JSON.parse(domResult);
+      if (parsed.typeaheadItems) {
+        return { type: 'typeahead-dom', items: parsed.typeaheadItems };
+      }
+      console.log('[Aetna] ✓ Got DOM scope result');
+      return { type: 'scope', body: domResult };
+    } catch {}
+  }
+
+  // Fall back to the typeahead items we scraped before clicking
+  if (typeaheadItems.length > 0) {
+    console.log('[Aetna] Using', typeaheadItems.length, 'typeahead items as fallback');
+    return { type: 'typeahead', items: typeaheadItems };
+  }
+
+  return null;
 }
 
-// ── Warm browser: navigate to ASA category page for ZIP ──────────────────────
+// ── Warm browser ──────────────────────────────────────────────────────────────
 async function initWarmPage(zip) {
   const t0 = Date.now();
-  console.log(`[Aetna] Warming browser for ZIP ${zip}...`);
+  console.log('[Aetna] Warming browser for ZIP', zip);
 
   const old = _h.browser;
   _h.browser = null; _h.page = null; _h.zip = null;
@@ -357,7 +441,7 @@ async function initWarmPage(zip) {
   _h.browser = browser;
   _h.page    = page;
   _h.zip     = zip;
-  console.log(`[Aetna] Warm done in ${Date.now() - t0}ms | page on category for ZIP ${zip}`);
+  console.log(`[Aetna] Warm done in ${Date.now() - t0}ms`);
   return page;
 }
 
@@ -370,20 +454,6 @@ async function getWarmPage(zip) {
   return _h.initPromise;
 }
 
-// ── Ensure warm page is on the category page (not results) ───────────────────
-async function ensureCategoryPage(page, zip) {
-  const bodyText = await page.evaluate(() => document.body.textContent || '').catch(() => '');
-  const onCategory = bodyText.includes('What do you want to search for') ||
-                     bodyText.includes('search term') ||
-                     bodyText.includes('Medical Doctors');
-  if (onCategory) {
-    console.log('[Aetna] Already on category page ✓');
-    return;
-  }
-  console.log('[Aetna] Not on category page — re-navigating...');
-  await navigateToASACategory(page, zip);
-}
-
 // ── Main export ───────────────────────────────────────────────────────────────
 async function searchAetna({
   specialty  = 'All Medical Specialists',
@@ -391,83 +461,84 @@ async function searchAetna({
   zip        = '77041',
   maxResults = 25,
 } = {}) {
-  // Ensure warm page exists
-  let page;
-  try {
-    page = await getWarmPage(zip);
-  } catch (e) {
-    console.log('[Aetna] Warm-up error:', e.message);
+  let page = await getWarmPage(zip).catch(e => {
     throw new Error('Aetna warm-up failed: ' + e.message);
-  }
+  });
 
   if (!name) {
-    // Specialty search: navigate to Medical Doctors category
     return searchBySpecialty(page, specialty, zip, maxResults);
   }
 
-  // Name search
   try {
-    // Make sure we're on the category page (not a previous results page)
-    await ensureCategoryPage(page, zip);
+    // Ensure we're on the category page
+    const onCat = await isOnCategoryPage(page);
+    if (!onCat) {
+      console.log('[Aetna] Not on category page — re-navigating');
+      await navigateToASACategory(page, zip);
+    }
 
     const t0 = Date.now();
-    const body = await searchNameOnCategoryPage(page, name, zip);
-    console.log(`[Aetna] Name search took ${Date.now() - t0}ms | got body: ${!!body}`);
+    const result = await searchNameOnCategoryPage(page, name, zip);
+    console.log(`[Aetna] Search done in ${Date.now() - t0}ms | type: ${result?.type || 'null'}`);
 
-    if (!body) throw new Error('No provider data returned from ASA search');
+    if (!result) throw new Error('No provider data from any method');
 
-    const all = parseAetnaBody(body);
-    if (!all.length) throw new Error(`0 providers parsed (body: ${body.substring(0, 200)})`);
+    let providers;
 
-    const filtered = filterByName(all, name);
-    console.log(`[Aetna] ✓ ${all.length} total → ${filtered.length} match "${name}"`);
+    if (result.type === 'api' || result.type === 'scope') {
+      providers = parseAetnaBody(result.body);
+    } else if (result.type === 'typeahead' || result.type === 'typeahead-dom') {
+      providers = parseTypeaheadText(result.items);
+    } else if (result.body) {
+      providers = parseAetnaBody(result.body);
+    }
 
-    // After getting results, we may be on results page — reset on next call
-    // Don't re-navigate now; ensureCategoryPage handles it next time
+    if (!providers?.length) throw new Error(`0 providers parsed from type=${result.type}`);
+
+    const filtered = filterByName(providers, name);
+    console.log(`[Aetna] ✓ ${providers.length} total → ${filtered.length} match "${name}"`);
     return dedup(filtered).slice(0, Math.min(maxResults, 10));
 
-  } catch (e) {
-    console.log('[Aetna] Name search failed:', e.message);
-    // Re-warm from scratch and retry once
-    console.log('[Aetna] Re-warming and retrying...');
+  } catch(e) {
+    console.log('[Aetna] Search failed:', e.message);
+    // Re-warm and retry once
     try {
       _h.page = null; _h.zip = null;
       page = await initWarmPage(zip);
-      const body = await searchNameOnCategoryPage(page, name, zip);
-      if (!body) throw new Error('No body on retry');
-      const all = parseAetnaBody(body);
-      const filtered = filterByName(all, name);
+      const result = await searchNameOnCategoryPage(page, name, zip);
+      if (!result) throw new Error('No data on retry');
+      const providers = (result.type === 'typeahead' || result.type === 'typeahead-dom')
+        ? parseTypeaheadText(result.items)
+        : parseAetnaBody(result.body || '{}');
+      const filtered = filterByName(providers, name);
       return dedup(filtered).slice(0, Math.min(maxResults, 10));
-    } catch (e2) {
-      throw new Error('Aetna search failed after retry: ' + e2.message);
+    } catch(e2) {
+      throw new Error('Aetna failed after retry: ' + e2.message);
     }
   }
 }
 
-// ── Specialty search via category tiles ──────────────────────────────────────
+// ── Specialty search ──────────────────────────────────────────────────────────
 async function searchBySpecialty(page, specialty, zip, maxResults) {
-  await ensureCategoryPage(page, zip);
+  const onCat = await isOnCategoryPage(page);
+  if (!onCat) await navigateToASACategory(page, zip);
 
-  const apiPromise = makeProviderListener(page, 30000);
+  const apiPromise = makeBroadListener(page, 30000);
 
-  // Click "Medical Doctors & Specialists" tile
-  const medDocsClicked = await page.evaluate(() => {
-    const els = document.querySelectorAll('a, button, div[ng-click], h3, h4');
+  await page.evaluate(() => {
+    const els = document.querySelectorAll('a, button, h3, h4, div[ng-click]');
     for (const el of els) {
       if (el.textContent?.includes('Medical Doctors') && el.offsetParent) {
         el.click();
-        return true;
+        return;
       }
     }
-    return false;
   });
-  console.log('[Aetna] Medical Doctors clicked:', medDocsClicked);
 
   const body = await apiPromise;
   if (!body) throw new Error('No API response from specialty search');
 
   const all = parseAetnaBody(body);
-  // Filter by specialty name
   const specLower = specialty.toLowerCase();
   const filtered = all.filter(p =>
     p.specialty.toLowerCase().includes(specLower) ||
