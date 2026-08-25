@@ -173,7 +173,8 @@ async function searchViaAngular(name, zip, maxResults) {
     // Search box gone — page may have navigated away. Try Angular $http as fallback.
     console.log('[Aetna] Search box not found, trying Angular $http fallback...');
     const clientId = _h.reqHeaders?.['x-ibm-client-id'] || '';
-    const injected = await _h.page.evaluate(([searchText, postalCode, pipeName, clientId]) => {
+    const templateUrl = _h.urlTemplate || '';
+    const injected = await _h.page.evaluate(([name, zip, clientId, templateUrl, apiBase]) => {
       try {
         const el = document.querySelector('[ng-app],[data-ng-app],.ng-scope,[ng-controller]');
         if (!el) return { error: 'no Angular root element' };
@@ -181,20 +182,34 @@ async function searchViaAngular(name, zip, maxResults) {
         if (!inj) return { error: 'no Angular injector' };
         const $http = inj.get('$http');
         if (!$http) return { error: 'no $http service' };
-        // Use the actual apiBase URL we captured (might be int or prod)
-        const base = 'https://api01.aetna.com/healthcore/prod/v3';
-        $http.get(base + '/publicdse_providersearch', {
+
+        // Build params from captured URL template (has the right productIdentifier etc.)
+        // Fall back to known-working params if no template
+        let params;
+        if (templateUrl) {
+          const u = new URL(templateUrl);
+          params = {};
+          u.searchParams.forEach((v, k) => { params[k] = v; });
+          params.searchText = name;
+          params.postalCode = zip;
+          params.maxResultCount = '25';
+          params.pageNum = '1';
+        } else {
+          params = { searchText: name, productIdentifier: '~MPPO', postalCode: zip, language: 'en', siteId: 'dse', responseLanguagePreference: 'en', radius: '75', maxResultCount: '25', pageNum: '1' };
+        }
+
+        const url = (apiBase || 'https://api01.aetna.com/healthcore/prod/v3') + '/publicdse_providersearch';
+        $http.get(url, {
           headers: clientId ? { 'x-ibm-client-id': clientId } : {},
-          params: { searchText, pipeName, responseLanguagePreference: 'en', siteId: 'dse', language: 'en', postalCode, suppressTypeAheadSearchQuery: 'true', radius: '75', maxResultCount: '25', pageNum: '1' },
+          params,
         });
-        // Force Angular digest so the $http request actually fires
         try {
           const $rootScope = inj.get('$rootScope');
           if (!$rootScope.$$phase) $rootScope.$apply(() => {});
         } catch {}
-        return { ok: true, clientId: !!clientId };
+        return { ok: true, clientId: !!clientId, usingTemplate: !!templateUrl };
       } catch(e) { return { error: e.message }; }
-    }, [name + ' (any location)', zip || '77041', 'Open Choice PPO', clientId]);
+    }, [name, zip || '77041', clientId, templateUrl, _h.apiBase]);
     console.log('[Aetna] Angular $http inject:', JSON.stringify(injected));
     if (injected?.error) throw new Error('Angular inject failed: ' + injected.error);
   }
@@ -357,6 +372,29 @@ async function getWarmPage(zip) {
 }
 
 // ── Main export ───────────────────────────────────────────────────────────────
+// ── Direct HTTPS using ALL captured headers (cookies + x-ibm-client-id) ──────
+// After warm-up, _h.reqHeaders has every header the browser sent including session
+// cookies. Sending them all bypasses the WAF that blocked header-stripped requests.
+async function searchFastHttps(name, zip, maxResults) {
+  if (!_h.urlTemplate || !_h.reqHeaders) throw new Error('No captured URL/headers');
+  const u = new URL(_h.urlTemplate);
+  u.searchParams.set('searchText', name);
+  u.searchParams.set('postalCode', zip || '77041');
+  u.searchParams.set('maxResultCount', '25');
+  u.searchParams.set('pageNum', '1');
+  // Strip hop-by-hop headers Node.js doesn't allow
+  const hdrs = { ..._h.reqHeaders };
+  delete hdrs['content-length']; delete hdrs['transfer-encoding'];
+  delete hdrs['connection']; delete hdrs['host'];
+  console.log('[Aetna] ⚡ Direct HTTPS search:', u.toString().substring(0, 180));
+  const { status, body } = await httpsGet(u.toString(), hdrs);
+  console.log('[Aetna] Direct HTTPS status:', status, '| body:', body.substring(0, 120));
+  if (status !== 200) throw new Error(`HTTP ${status}`);
+  const parsed = parseAetnaBody(body);
+  if (!parsed.length) throw new Error(`0 providers (body: ${body.substring(0, 150)})`);
+  return dedup(parsed).slice(0, Math.min(maxResults, 8));
+}
+
 async function searchAetna({
   specialty  = 'All Medical Specialists',
   name       = '',
@@ -368,41 +406,38 @@ async function searchAetna({
   // ── Name search ─────────────────────────────────────────────────────────────
   if (isNameSearch) {
 
-    // 1. If we have a warm browser page → inject Angular $http search (~3-8s)
-    //    This runs the request INSIDE the browser so WAF/cookies are handled correctly.
+    // 1. Warm browser if we don't have headers yet
+    if (!_h.urlTemplate || !_h.reqHeaders || !_h.page) {
+      console.log('[Aetna] Warming browser...');
+      try { await getWarmPage(zip); } catch (e) { console.log('[Aetna] Warm-up failed:', e.message); }
+      console.log('[Aetna] Post-warm: page=', _h.page ? 'SET' : 'NULL', '| urlTemplate:', !!_h.urlTemplate, '| headers:', !!_h.reqHeaders);
+    }
+
+    // 2. Direct HTTPS with all captured headers (~1-2s) — WAF accepts it because
+    //    we send session cookies + every original browser header
+    if (_h.urlTemplate && _h.reqHeaders) {
+      try {
+        const results = await searchFastHttps(name, zip, maxResults);
+        console.log(`[Aetna] ⚡ Direct HTTPS success: ${results.length} providers`);
+        return results;
+      } catch (e) {
+        console.log('[Aetna] Direct HTTPS failed:', e.message, '— trying Angular injection...');
+      }
+    }
+
+    // 3. Angular $http injection inside warm browser (~5-10s)
     if (_h.page && !_h.page.isClosed()) {
       try {
         const results = await searchViaAngular(name, zip, maxResults);
-        console.log(`[Aetna] ⚡ Angular fast success: ${results.length} providers`);
+        console.log(`[Aetna] ⚡ Angular injection success: ${results.length} providers`);
         return results;
       } catch (e) {
-        console.log('[Aetna] Angular fast path failed:', e.message);
-        // Page may have gone stale — clear it and fall through to re-warm
-        _h.page = null;
+        console.log('[Aetna] Angular injection failed:', e.message);
       }
     }
 
-    // 2. No warm page yet → warm browser, then warm-page typeahead search
-    console.log('[Aetna] Warming browser...');
-    try {
-      await getWarmPage(zip);
-    } catch (e) {
-      console.log('[Aetna] Warm-up failed:', e.message);
-    }
-    console.log('[Aetna] Post-warm state: page=', _h.page ? 'SET' : 'NULL', '| page closed:', _h.page?.isClosed?.());
-
-    if (_h.page) {
-      try {
-        const results = await searchViaAngular(name, zip, maxResults);
-        console.log(`[Aetna] ⚡ Angular fast success (after warm): ${results.length} providers`);
-        return results;
-      } catch (e) {
-        console.log('[Aetna] Angular search failed after warm:', e.message);
-      }
-    }
-
-    // 3. Last resort: use a fresh browser + typeahead click
-    console.log('[Aetna] Falling back to full typeahead...');
+    // 4. Last resort: full fresh browser (~60s)
+    console.log('[Aetna] Falling back to full browser typeahead...');
     return searchAetnaFreshBrowserTypeahead(name, zip, maxResults);
   }
 
