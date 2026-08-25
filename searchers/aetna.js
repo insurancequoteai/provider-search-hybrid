@@ -14,13 +14,14 @@ chromium.use(StealthPlugin());
 
 // ── Module-level auth cache ───────────────────────────────────────────────────
 const _h = {
-  urlTemplate : null,   // full API URL captured from AngularJS request (best case)
-  reqHeaders  : null,   // all request headers (incl. x-ibm-client-id) from that request
-  apiBase     : null,   // e.g. 'https://api01.aetna.com/healthcore/prod/v3' (from first captured request)
-  browser     : null,   // warm browser kept alive between Railway requests
-  page        : null,
-  zip         : null,
-  initPromise : null,
+  urlTemplate   : null,   // full API URL captured from AngularJS request
+  reqHeaders    : null,   // all request headers (incl. x-ibm-client-id)
+  apiBase       : null,   // e.g. 'https://api01.aetna.com/healthcore/prod/v3'
+  searchPageUrl : null,   // URL of the providerSearch page (for fast re-navigation)
+  browser       : null,   // warm browser kept alive between Railway requests
+  page          : null,
+  zip           : null,
+  initPromise   : null,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -99,91 +100,85 @@ const BROWSER_ARGS = [
   '--disable-extensions','--disable-component-update','--safebrowsing-disable-auto-update',
 ];
 
-// ── Search via Angular $http injected directly into the warm browser (~3-8s) ──
-// Uses page.evaluate() to call Angular's $http.get() and AWAIT the promise inside
-// the browser — the resolved response body is returned directly to Node.js.
-// No external response listener = no race condition with the results page's own
-// publicdse_providersearch requests.
+// ── Search by typing into the warm browser's search box and capturing typeahead ─
+// Angular fires the right API request with correct auth/params automatically.
+// We listen for the response and capture it — no manual param guessing needed.
 async function searchViaAngular(name, zip, maxResults) {
   if (!_h.page || _h.page.isClosed()) throw new Error('No warm page available');
 
-  console.log('[Aetna] ⚡ Angular $http direct search for:', name);
+  console.log('[Aetna] ⚡ Type-and-capture search for:', name);
 
-  const clientId = _h.reqHeaders?.['x-ibm-client-id'] || '';
-  const apiBase  = _h.apiBase || 'https://api01.aetna.com/healthcore/prod/v3';
-  const apiUrl   = apiBase + '/publicdse_providersearch';
+  // Ensure we're on the search page (has the search input box)
+  const inp = _h.page.locator('#Doctors, input[ng-model="criteria.typeAheadSearch"]').first();
+  let inpCount = await inp.count().catch(() => 0);
+  console.log('[Aetna] Search input found:', inpCount > 0, '| page URL:', _h.page.url().substring(0, 100));
 
-  console.log('[Aetna] Angular inject: clientId:', clientId ? clientId.substring(0, 8) + '...' : 'NONE', '| apiUrl:', apiUrl);
-
-  // Await the Angular $http promise INSIDE the browser — returns the body directly.
-  // This works whether we're on the search page or results page.
-  const result = await _h.page.evaluate(
-    ([name, zip, clientId, apiUrl]) => {
-      return new Promise((resolve) => {
-        try {
-          // Find Angular root — try multiple selectors
-          const el = document.querySelector('[ng-app],[data-ng-app],.ng-scope,[ng-controller],[ui-view]')
-                  || document.body;
-          if (!el) return resolve({ error: 'no DOM element found' });
-          const inj = window.angular?.element(el)?.injector?.()
-                   || window.angular?.element(document.body)?.injector?.();
-          if (!inj) return resolve({ error: 'no Angular injector (angular not ready?)' });
-          const $http = inj.get('$http');
-          if (!$http) return resolve({ error: 'no $http service' });
-
-          const params = {
-            searchText: name,
-            productIdentifier: '~MPPO',
-            postalCode: zip,
-            language: 'en',
-            siteId: 'dse',
-            responseLanguagePreference: 'en',
-            radius: '75',
-            maxResultCount: '25',
-            pageNum: '1',
-          };
-
-          const t = setTimeout(() => resolve({ error: 'angular $http timeout after 22s' }), 22000);
-
-          $http.get(apiUrl, {
-            headers: clientId ? { 'x-ibm-client-id': clientId } : {},
-            params,
-          }).then(
-            resp => {
-              clearTimeout(t);
-              resolve({ ok: true, body: JSON.stringify(resp.data) });
-            },
-            err => {
-              clearTimeout(t);
-              const errBody = err.data ? JSON.stringify(err.data).substring(0, 300) : '';
-              resolve({ error: 'http_' + err.status, body: errBody });
-            }
-          );
-
-          // Force Angular $digest so the $http request actually fires
-          setTimeout(() => {
-            try {
-              const $rootScope = inj.get('$rootScope');
-              if (!$rootScope.$$phase) $rootScope.$apply(() => {});
-            } catch(e) { /* digest already running — ok */ }
-          }, 50);
-        } catch(e) { resolve({ error: e.message }); }
-      });
-    },
-    [name, zip || '77041', clientId, apiUrl]
-  );
-
-  console.log('[Aetna] Angular $http result:', result?.ok ? 'ok' : ('ERR: ' + result?.error),
-    '| body length:', result?.body?.length, '| prefix:', result?.body?.substring(0, 80));
-
-  if (result?.error) {
-    throw new Error('Angular $http: ' + result.error
-      + (result.body ? ' | ' + result.body.substring(0, 120) : ''));
+  if (inpCount === 0) {
+    // Navigate directly back to search page — much faster than full flow (~5-10s vs ~50s)
+    const searchUrl = _h.searchPageUrl ||
+      'https://www.aetna.com/dsepublic/#/contentPage?page=providerSearch&productIdentifier=~MPPO&siteId=dse&language=en';
+    console.log('[Aetna] Re-navigating to search page:', searchUrl.substring(0, 120));
+    await _h.page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(e =>
+      console.log('[Aetna] Navigation error:', e.message));
+    await _h.page.waitForSelector('#Doctors, input[ng-model="criteria.typeAheadSearch"]',
+      { timeout: 12000 }).catch(() => {});
+    inpCount = await inp.count().catch(() => 0);
+    if (inpCount === 0) throw new Error('Search input not found after re-navigation');
   }
-  if (!result?.body) throw new Error('Angular $http: no body returned');
 
-  const parsed = parseAetnaBody(result.body);
-  if (!parsed.length) throw new Error(`0 providers in Angular response (body: ${result.body.substring(0, 200)})`);
+  // Set up listener for ANY api01.aetna.com response that contains provider data.
+  // We look for the typeahead/search response Angular fires automatically when you type.
+  const bodyPromise = new Promise((resolve) => {
+    const timeout = setTimeout(() => {
+      _h.page.off('response', handler);
+      console.log('[Aetna] Response timeout after 15s — no provider data received');
+      resolve(null);
+    }, 15000);
+
+    const handler = async (res) => {
+      const url = res.url();
+      if (!url.includes('api01.aetna.com')) return;
+      const ep = url.split('/').pop()?.split('?')[0] || '';
+      // Skip noisy endpoints
+      if (['publicdse_pagecontent', 'publicdse_productcodes', 'publicdse_providerratings'].includes(ep)) return;
+
+      const status = res.status();
+      console.log('[Aetna] Response from endpoint:', ep, '| status:', status, '| url:', url.substring(0, 180));
+      if (status >= 400) return;
+
+      try {
+        const body = await res.text();
+        console.log('[Aetna] Body[' + ep + '] len=' + body.length + ' prefix:', body.substring(0, 120));
+        // Check for provider data (any format)
+        if (body.includes('providerInfoResponses') || body.includes('providerDisplayName')) {
+          // Make sure it's not a 3000 error
+          if (body.includes('"statusCode":"3000"') || body.includes('"statusCode":3000')) {
+            console.log('[Aetna] Skipping — got statusCode 3000 error from', ep);
+            return;
+          }
+          clearTimeout(timeout);
+          _h.page.off('response', handler);
+          console.log('[Aetna] ✓ Provider data found in endpoint:', ep);
+          resolve(body);
+        }
+      } catch(e) { console.log('[Aetna] Error reading', ep, ':', e.message); }
+    };
+    _h.page.on('response', handler);
+  });
+
+  // Type name to trigger Angular's typeahead — Angular fires the API request automatically
+  await inp.click({ clickCount: 3 });
+  await _h.page.waitForTimeout(100);
+  await inp.fill('');
+  const query = name.length >= 3 ? name.substring(0, 25) : name + ' aa';
+  await inp.type(query, { delay: 60 });
+  console.log('[Aetna] Typed:', query, '— waiting for provider data...');
+
+  const body = await bodyPromise;
+  if (!body) throw new Error('No provider data from typeahead in 15s');
+
+  const parsed = parseAetnaBody(body);
+  if (!parsed.length) throw new Error(`0 providers in response (body: ${body.substring(0, 200)})`);
   return dedup(parsed).slice(0, Math.min(maxResults, 8));
 }
 
@@ -244,13 +239,13 @@ async function initWarmPage(zip) {
 
   // Safely close previous browser
   const old = _h.browser;
-  _h.browser = null; _h.page = null;
+  _h.browser = null; _h.page = null; _h.searchPageUrl = null;
   if (old) { try { await old.close(); } catch {} }
 
   const browser = await chromium.launch({ headless: true, args: BROWSER_ARGS });
   _h.browser = browser;
   browser.on('disconnected', () => {
-    if (_h.browser === browser) { _h.browser = null; _h.page = null; _h.zip = null; }
+    if (_h.browser === browser) { _h.browser = null; _h.page = null; _h.zip = null; _h.searchPageUrl = null; }
   });
 
   const page = await browser.newPage();
@@ -294,27 +289,31 @@ async function initWarmPage(zip) {
 
   await navigateToSearch(page, zip);
 
-  // Always trigger typeahead to: (1) confirm search box is available, (2) capture any
-  // publicdse_providersearch request and its auth headers if we don't have them yet.
+  // Trigger typeahead to confirm the search box works and capture any auth headers.
+  // IMPORTANT: Do NOT press Enter — that navigates to the results page and breaks
+  // subsequent searches. We stay on the search page so searchViaAngular can reuse it.
   const inp = page.locator('#Doctors, input[ng-model="criteria.typeAheadSearch"]').first();
   const inpCount = await inp.count().catch(() => 0);
   console.log('[Aetna] Search input available after navigation:', inpCount > 0);
+
+  // Store the search page URL for fast re-navigation if we ever get navigated away
+  _h.searchPageUrl = page.url();
+  console.log('[Aetna] Search page URL stored:', _h.searchPageUrl);
+
   if (inpCount > 0) {
     try {
       await inp.click();
       await page.waitForTimeout(200);
       await inp.fill('smith');
-      await page.waitForTimeout(200);
-      // Press Enter to trigger actual provider search (typing alone only opens dropdown)
-      await page.keyboard.press('Enter');
-      // Wait up to 12s for actual provider SEARCH response (not ratings/reviews)
+      await page.waitForTimeout(600);
+      // Wait for any api01.aetna.com response (typeahead fires immediately when typing)
       await page.waitForResponse(
-        r => r.url().includes('publicdse_providersearch'),
-        { timeout: 12000 }
-      ).catch(() => console.log('[Aetna] No provider search response during warm-up (ok, will search on demand)'));
-      await page.waitForTimeout(300);
+        r => r.url().includes('api01.aetna.com') && !r.url().includes('pagecontent') && !r.url().includes('productcodes'),
+        { timeout: 8000 }
+      ).catch(() => console.log('[Aetna] No typeahead response during warm-up (ok)'));
+      await page.waitForTimeout(200);
     } catch (e) {
-      console.log('[Aetna] Typeahead trigger error:', e.message);
+      console.log('[Aetna] Warm-up typeahead error:', e.message);
     }
   } else {
     console.log('[Aetna] ⚠ Search input NOT found after navigation — page may be in wrong state');
@@ -390,7 +389,7 @@ async function searchAetna({
   // ── Name search ─────────────────────────────────────────────────────────────
   if (isNameSearch) {
 
-    // 1. Warm browser if we don't have a live page + auth headers yet
+    // 1. Warm browser if we don't have a live page yet
     if (!_h.page || !_h.reqHeaders) {
       console.log('[Aetna] Warming browser...');
       try { await getWarmPage(zip); } catch (e) { console.log('[Aetna] Warm-up failed:', e.message); }
