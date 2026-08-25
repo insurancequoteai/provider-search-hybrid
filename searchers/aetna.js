@@ -614,40 +614,52 @@ async function searchBySpecialty(page, specialty, zip, maxResults) {
   console.log(`[Aetna] Specialty "${specialty}" → tile "${category}"`);
 
   // Set up API listener in parallel (bonus if it fires)
-  const apiPromise = makeBroadListener(page, 18000);
+  const apiPromise = makeBroadListener(page, 30000);
 
-  // Click the matching category tile
-  const clicked = await page.evaluate((cat) => {
-    const els = Array.from(document.querySelectorAll('a, button, h3, h4, div[ng-click], [class*="tile"]'));
-    for (const el of els) {
-      if (el.offsetParent && (el.textContent || '').includes(cat)) {
-        el.click();
-        return (el.textContent || '').trim().substring(0, 60);
-      }
+  // Use Playwright locator for reliable Angular click
+  // Try the exact category first, then "Medical Doctors" as fallback
+  const tryLabels = [category, 'Medical Doctors'];
+  let clicked = false;
+  for (const label of tryLabels) {
+    const loc = page.locator(`a, h3, h4, button, [ng-click]`).filter({ hasText: label }).first();
+    if (await loc.count().catch(() => 0) > 0) {
+      await loc.click({ timeout: 5000 }).catch(() => {});
+      console.log(`[Aetna] Clicked tile: ${label}`);
+      clicked = true;
+      break;
     }
-    // Fallback: click Medical Doctors
-    for (const el of els) {
-      if (el.offsetParent && (el.textContent || '').includes('Medical Doctors')) {
-        el.click();
-        return 'Medical Doctors (fallback)';
-      }
-    }
-    return null;
-  }, category);
+  }
+  if (!clicked) {
+    console.log('[Aetna] No tile found — pressing Enter');
+    await page.keyboard.press('Enter');
+  }
 
-  console.log('[Aetna] Tile clicked:', clicked);
-
-  // Wait for results page to appear
+  // Step 1: Wait for the category page text to DISAPPEAR (Angular routing started)
   await page.waitForFunction(
-    () => (document.body.textContent || '').includes('Provider/Facility Information') ||
-          (document.body.textContent || '').includes('In network search results') ||
-          (document.body.textContent || '').includes('Start New Search'),
-    { timeout: 20000 }
-  ).catch(() => console.log('[Aetna] Results page timeout — attempting DOM scrape anyway'));
+    () => !(document.body.textContent || '').includes('What do you want to search for'),
+    { timeout: 15000 }
+  ).catch(() => console.log('[Aetna] Category page still visible after 15s'));
 
-  await page.waitForTimeout(800);
+  // Step 2: Wait for provider links (end with " »") to appear in DOM
+  const hasProviders = await page.waitForFunction(
+    () => Array.from(document.querySelectorAll('a')).some(a => {
+      const t = (a.textContent || '').trim();
+      return t.endsWith('»') && t.length > 5 && t.length < 150;
+    }),
+    { timeout: 35000 }
+  ).catch(() => null);
 
-  // Primary: scrape results from DOM (no API needed)
+  if (!hasProviders) {
+    console.log('[Aetna] Provider links never appeared — dumping body snippet');
+    const snippet = await page.evaluate(() =>
+      (document.body.textContent || '').replace(/\s+/g, ' ').substring(0, 500)
+    ).catch(() => '');
+    console.log('[Aetna] Page text:', snippet);
+  }
+
+  await page.waitForTimeout(600);
+
+  // Primary: scrape results from DOM
   const domProviders = await scrapeSpecialtyResultsPage(page);
   console.log(`[Aetna] DOM scrape found ${domProviders.length} providers`);
 
@@ -673,9 +685,10 @@ async function searchBySpecialty(page, specialty, zip, maxResults) {
   // Fallback: API body if it came in
   const body = await Promise.race([
     apiPromise,
-    new Promise(r => setTimeout(() => r(null), 3000)),
+    new Promise(r => setTimeout(() => r(null), 5000)),
   ]);
   if (body) {
+    console.log('[Aetna] Using API body as fallback for specialty');
     const all = parseAetnaBody(body);
     return dedup(all).slice(0, maxResults);
   }
